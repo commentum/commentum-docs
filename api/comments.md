@@ -1,11 +1,22 @@
 # Comments API
 
-The Comments API handles all comment-related operations including creation, editing, deletion, and moderation actions.
+The Comments API handles all comment-related operations including creation, editing, deletion, and moderation actions using secure session-based authentication.
+
+## 🔒 Security Overview
+
+**CRITICAL**: This API uses session-based authentication. The `user_id` parameter has been removed to prevent identity spoofing. User identity is extracted from the session token.
 
 ## Endpoint
 
 ```
-POST /comments
+POST /functions/v1/comments
+```
+
+## Request Headers
+
+```http
+Authorization: Bearer <session_token>
+Content-Type: application/json
 ```
 
 ## Request Body
@@ -13,8 +24,14 @@ POST /comments
 ```typescript
 interface CommentRequest {
   action: 'create' | 'edit' | 'delete' | 'restore' | 'pin' | 'unpin' | 'lock' | 'unlock' | 'tag' | 'untag'
-  user_id: number
   media_id?: number
+  media_info?: {
+    external_id: string
+    media_type: 'anime' | 'manga' | 'movie' | 'tv' | 'other'
+    title: string
+    year?: number
+    poster_url?: string
+  }
   parent_id?: number
   comment_id?: number
   content?: string
@@ -28,28 +45,77 @@ interface CommentRequest {
 | Parameter | Type | Required | Actions | Description |
 |-----------|------|----------|---------|-------------|
 | `action` | string | Yes | All | The action to perform |
-| `user_id` | number | Yes | All | ID of the user performing the action |
 | `media_id` | number | create | Create | ID of the media item being commented on |
+| `media_info` | object | create | Create | Media information for auto-creation |
 | `parent_id` | number | create | Create | ID of parent comment (for replies) |
 | `comment_id` | number | edit/delete/restore/pin/unpin/lock/unlock/tag/untag | Moderation | ID of the target comment |
 | `content` | string | create/edit | Content | Comment content (max length configured in system) |
 | `tag_type` | string | tag/untag | Tagging | Type of tag to apply/remove |
 | `reason` | string | moderation actions | Moderation | Reason for the action |
 
+## 🆕 Auto Media Creation
+
+### Option 1: Use Existing Media ID
+```json
+{
+  "action": "create",
+  "media_id": 456,
+  "content": "This is a great anime!"
+}
+```
+
+### Option 2: Auto-Create Media (NEW)
+```json
+{
+  "action": "create",
+  "media_info": {
+    "external_id": "12345",
+    "media_type": "anime",
+    "title": "Attack on Titan",
+    "year": 2013,
+    "poster_url": "https://example.com/poster.jpg"
+  },
+  "content": "This is a great anime!"
+}
+```
+
+**Response for Auto-Creation:**
+```json
+{
+  "comment": { ... },
+  "media_id": 456
+}
+```
+
 ## Actions
 
 ### 1. Create Comment
 
-**Required Parameters:** `action: 'create'`, `user_id`, `media_id`, `content`
+**Required Parameters:** `action: 'create'`, `content`
 
-**Optional Parameters:** `parent_id`
+**Either `media_id` OR `media_info` is required**
 
-#### Request
+#### Request (Existing Media)
 ```json
 {
   "action": "create",
-  "user_id": 123,
   "media_id": 456,
+  "content": "This is a great anime!",
+  "parent_id": 789
+}
+```
+
+#### Request (Auto-Create Media)
+```json
+{
+  "action": "create",
+  "media_info": {
+    "external_id": "12345",
+    "media_type": "anime",
+    "title": "Attack on Titan",
+    "year": 2013,
+    "poster_url": "https://example.com/poster.jpg"
+  },
   "content": "This is a great anime!",
   "parent_id": 789
 }
@@ -58,31 +124,33 @@ interface CommentRequest {
 #### Response (201 Created)
 ```json
 {
-  "id": 1001,
-  "media_id": 456,
-  "user_id": 123,
-  "parent_id": 789,
-  "content": "This is a great anime!",
-  "content_html": "This is a great anime!",
-  "deleted": false,
-  "pinned": false,
-  "locked": false,
-  "edited": false,
-  "edit_count": 0,
-  "created_at": "2024-01-15T10:30:00Z",
-  "updated_at": "2024-01-15T10:30:00Z"
+  "comment": {
+    "id": 1001,
+    "media_id": 456,
+    "user_id": 123,
+    "parent_id": 789,
+    "content": "This is a great anime!",
+    "content_html": "This is a great anime!",
+    "deleted": false,
+    "pinned": false,
+    "locked": false,
+    "edited": false,
+    "edit_count": 0,
+    "created_at": "2024-01-15T10:30:00Z",
+    "updated_at": "2024-01-15T10:30:00Z"
+  },
+  "media_id": 456
 }
 ```
 
 ### 2. Edit Comment
 
-**Required Parameters:** `action: 'edit'`, `user_id`, `comment_id`, `content`
+**Required Parameters:** `action: 'edit'`, `comment_id`, `content`
 
 #### Request
 ```json
 {
   "action": "edit",
-  "user_id": 123,
   "comment_id": 1001,
   "content": "This is an amazing anime! The animation is stunning."
 }
@@ -91,25 +159,26 @@ interface CommentRequest {
 #### Response (200 OK)
 ```json
 {
-  "id": 1001,
-  "content": "This is an amazing anime! The animation is stunning.",
-  "content_html": "This is an amazing anime! The animation is stunning.",
-  "edited": true,
-  "edited_at": "2024-01-15T11:00:00Z",
-  "edit_count": 1,
-  "updated_at": "2024-01-15T11:00:00Z"
+  "comment": {
+    "id": 1001,
+    "content": "This is an amazing anime! The animation is stunning.",
+    "content_html": "This is an amazing anime! The animation is stunning.",
+    "edited": true,
+    "edited_at": "2024-01-15T11:00:00Z",
+    "edit_count": 1,
+    "updated_at": "2024-01-15T11:00:00Z"
+  }
 }
 ```
 
 ### 3. Delete Comment
 
-**Required Parameters:** `action: 'delete'`, `user_id`, `comment_id`
+**Required Parameters:** `action: 'delete'`, `comment_id`
 
 #### Request
 ```json
 {
   "action": "delete",
-  "user_id": 123,
   "comment_id": 1001
 }
 ```
@@ -117,22 +186,23 @@ interface CommentRequest {
 #### Response (200 OK)
 ```json
 {
-  "id": 1001,
-  "deleted": true,
-  "deleted_at": "2024-01-15T11:30:00Z",
-  "deleted_by": 123
+  "comment": {
+    "id": 1001,
+    "deleted": true,
+    "deleted_at": "2024-01-15T11:30:00Z",
+    "deleted_by": 123
+  }
 }
 ```
 
 ### 4. Restore Comment
 
-**Required Parameters:** `action: 'restore'`, `user_id`, `comment_id`
+**Required Parameters:** `action: 'restore'`, `comment_id`
 
 #### Request
 ```json
 {
   "action": "restore",
-  "user_id": 123,
   "comment_id": 1001
 }
 ```
@@ -140,22 +210,23 @@ interface CommentRequest {
 #### Response (200 OK)
 ```json
 {
-  "id": 1001,
-  "deleted": false,
-  "deleted_at": null,
-  "deleted_by": null
+  "comment": {
+    "id": 1001,
+    "deleted": false,
+    "deleted_at": null,
+    "deleted_by": null
+  }
 }
 ```
 
 ### 5. Pin Comment
 
-**Required Parameters:** `action: 'pin'`, `user_id`, `comment_id`
+**Required Parameters:** `action: 'pin'`, `comment_id`
 
 #### Request
 ```json
 {
   "action": "pin",
-  "user_id": 123,
   "comment_id": 1001
 }
 ```
@@ -163,22 +234,23 @@ interface CommentRequest {
 #### Response (200 OK)
 ```json
 {
-  "id": 1001,
-  "pinned": true,
-  "pinned_at": "2024-01-15T12:00:00Z",
-  "pinned_by": 123
+  "comment": {
+    "id": 1001,
+    "pinned": true,
+    "pinned_at": "2024-01-15T12:00:00Z",
+    "pinned_by": 123
+  }
 }
 ```
 
 ### 6. Lock Comment Thread
 
-**Required Parameters:** `action: 'lock'`, `user_id`, `comment_id`
+**Required Parameters:** `action: 'lock'`, `comment_id`
 
 #### Request
 ```json
 {
   "action": "lock",
-  "user_id": 123,
   "comment_id": 1001
 }
 ```
@@ -186,22 +258,23 @@ interface CommentRequest {
 #### Response (200 OK)
 ```json
 {
-  "id": 1001,
-  "locked": true,
-  "locked_at": "2024-01-15T12:30:00Z",
-  "locked_by": 123
+  "comment": {
+    "id": 1001,
+    "locked": true,
+    "locked_at": "2024-01-15T12:30:00Z",
+    "locked_by": 123
+  }
 }
 ```
 
 ### 7. Tag Comment
 
-**Required Parameters:** `action: 'tag'`, `user_id`, `comment_id`, `tag_type`
+**Required Parameters:** `action: 'tag'`, `comment_id`, `tag_type`
 
 #### Request
 ```json
 {
   "action": "tag",
-  "user_id": 123,
   "comment_id": 1001,
   "tag_type": "spoiler"
 }
@@ -210,11 +283,13 @@ interface CommentRequest {
 #### Response (201 Created)
 ```json
 {
-  "id": 501,
-  "comment_id": 1001,
-  "tag_type": "spoiler",
-  "tagged_by": 123,
-  "created_at": "2024-01-15T13:00:00Z"
+  "tag": {
+    "id": 501,
+    "comment_id": 1001,
+    "tag_type": "spoiler",
+    "tagged_by": 123,
+    "created_at": "2024-01-15T13:00:00Z"
+  }
 }
 ```
 
@@ -224,6 +299,20 @@ interface CommentRequest {
 ```json
 {
   "error": "Comment too long"
+}
+```
+
+### 401 Unauthorized
+```json
+{
+  "error": "Missing session token"
+}
+```
+
+### 401 Unauthorized (Session Expired)
+```json
+{
+  "error": "Invalid or expired session token"
 }
 ```
 
@@ -237,7 +326,7 @@ interface CommentRequest {
 ### 404 Not Found
 ```json
 {
-  "error": "User not found"
+  "error": "Media ID or media info is required"
 }
 ```
 
@@ -254,6 +343,50 @@ interface CommentRequest {
   "error": "Internal server error"
 }
 ```
+
+## 🔐 Authentication
+
+### Session-Based Authentication
+
+All requests must include a valid session token:
+
+```javascript
+// ❌ OLD (Vulnerable)
+const response = await fetch('/functions/v1/comments', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({
+    action: 'create',
+    user_id: 123,  // Could be faked!
+    media_id: 456,
+    content: 'Comment text'
+  })
+})
+
+// ✅ NEW (Secure)
+const sessionToken = localStorage.getItem('commentum_session_token')
+const response = await fetch('/functions/v1/comments', {
+  method: 'POST',
+  headers: {
+    'Authorization': `Bearer ${sessionToken}`,
+    'Content-Type': 'application/json'
+  },
+  body: JSON.stringify({
+    action: 'create',
+    media_id: 456,
+    content: 'Comment text'  // No user_id needed!
+  })
+})
+```
+
+### Session Validation
+
+The API automatically:
+1. Extracts session token from Authorization header
+2. Validates session against database
+3. Checks user status (banned/muted)
+4. Updates last used time
+5. Extracts user ID from session
 
 ## Validation Rules
 
@@ -273,64 +406,79 @@ interface CommentRequest {
 - **Locked Comments**: Cannot reply to locked comments
 - **Deleted Comments**: Cannot edit deleted comments
 
-## Usage Examples
+## 🚀 Usage Examples
 
-### React Component for Comment Creation
+### React Hook with Session Management
 
 ```typescript
-import { useState } from 'react';
+import { useState, useCallback } from 'react'
 
 interface CommentFormProps {
-  mediaId: number;
-  userId: number;
-  parentId?: number;
-  onCommentCreated: (comment: any) => void;
+  mediaId?: number
+  mediaInfo?: MediaInfo
+  parentId?: number
+  onCommentCreated: (comment: any) => void
 }
 
 export const CommentForm: React.FC<CommentFormProps> = ({
   mediaId,
-  userId,
+  mediaInfo,
   parentId,
   onCommentCreated
 }) => {
-  const [content, setContent] = useState('');
-  const [submitting, setSubmitting] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [content, setContent] = useState('')
+  const [submitting, setSubmitting] = useState(false)
+  const [error, setError] = useState<string | null>(null)
 
   const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!content.trim()) return;
+    e.preventDefault()
+    if (!content.trim()) return
 
-    setSubmitting(true);
-    setError(null);
+    setSubmitting(true)
+    setError(null)
 
     try {
-      const response = await fetch('/comments', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          action: 'create',
-          user_id: userId,
-          media_id: mediaId,
-          content: content.trim(),
-          parent_id: parentId
-        })
-      });
-
-      const data = await response.json();
-
-      if (!response.ok) {
-        throw new Error(data.error);
+      const sessionToken = localStorage.getItem('commentum_session_token')
+      if (!sessionToken) {
+        throw new Error('Not authenticated')
       }
 
-      onCommentCreated(data);
-      setContent('');
+      const requestBody: any = {
+        action: 'create',
+        content: content.trim(),
+        parent_id: parentId
+      }
+
+      // Use existing media_id or provide media_info for auto-creation
+      if (mediaId) {
+        requestBody.media_id = mediaId
+      } else if (mediaInfo) {
+        requestBody.media_info = mediaInfo
+      }
+
+      const response = await fetch('/functions/v1/comments', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${sessionToken}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(requestBody)
+      })
+
+      const data = await response.json()
+
+      if (!response.ok) {
+        throw new Error(data.error)
+      }
+
+      onCommentCreated(data.comment)
+      setContent('')
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to post comment');
+      setError(err instanceof Error ? err.message : 'Failed to post comment')
     } finally {
-      setSubmitting(false);
+      setSubmitting(false)
     }
-  };
+  }
 
   return (
     <form onSubmit={handleSubmit} className="comment-form">
@@ -346,89 +494,183 @@ export const CommentForm: React.FC<CommentFormProps> = ({
         {submitting ? 'Posting...' : 'Post Comment'}
       </button>
     </form>
-  );
-};
+  )
+}
 ```
 
-### Comment Moderation Panel
+### Vue.js with Auto Media Creation
 
 ```typescript
-interface ModerationActionsProps {
-  comment: any;
-  userId: number;
-  userRole: string;
-  onAction: (action: string, result: any) => void;
-}
+import { ref, computed } from 'vue'
 
-export const ModerationActions: React.FC<ModerationActionsProps> = ({
-  comment,
-  userId,
-  userRole,
-  onAction
-}) => {
-  const handleAction = async (action: string, extraData = {}) => {
-    try {
-      const response = await fetch('/comments', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          action,
-          user_id: userId,
-          comment_id: comment.id,
-          ...extraData
-        })
-      });
+export default {
+  props: {
+    mediaId: Number,
+    parentId: Number
+  },
+  emits: ['comment-created'],
+  setup(props, { emit }) {
+    const content = ref('')
+    const submitting = ref(false)
+    const error = ref(null)
+    const sessionToken = localStorage.getItem('commentum_session_token')
 
-      const result = await response.json();
-
-      if (!response.ok) {
-        throw new Error(result.error);
+    const createComment = async () => {
+      if (!content.value.trim()) return
+      if (!sessionToken) {
+        error.value = 'Not authenticated'
+        return
       }
 
-      onAction(action, result);
-    } catch (error) {
-      console.error(`Failed to ${action} comment:`, error);
-    }
-  };
+      submitting.value = true
+      error.value = null
 
-  return (
-    <div className="moderation-actions">
-      {!comment.deleted && (
-        <button onClick={() => handleAction('delete')}>
-          Delete
-        </button>
-      )}
-      
-      {comment.deleted && (
-        <button onClick={() => handleAction('restore')}>
-          Restore
-        </button>
-      )}
-      
-      <button onClick={() => handleAction(comment.pinned ? 'unpin' : 'pin')}>
-        {comment.pinned ? 'Unpin' : 'Pin'}
-      </button>
-      
-      <button onClick={() => handleAction(comment.locked ? 'unlock' : 'lock')}>
-        {comment.locked ? 'Unlock' : 'Lock'}
-      </button>
-      
-      <select onChange={(e) => {
-        if (e.target.value) {
-          handleAction('tag', { tag_type: e.target.value });
-          e.target.value = '';
+      try {
+        const requestBody = {
+          action: 'create',
+          content: content.value.trim(),
+          parent_id: props.parentId
         }
-      }}>
-        <option value="">Add Tag...</option>
-        <option value="spoiler">Spoiler</option>
-        <option value="nsfw">NSFW</option>
-        <option value="warning">Warning</option>
-        <option value="offensive">Offensive</option>
-        <option value="spam">Spam</option>
-      </select>
-    </div>
-  );
-};
+
+        // If no mediaId, create media automatically
+        if (!props.mediaId) {
+          requestBody.media_info = {
+            external_id: '12345',
+            media_type: 'anime',
+            title: 'Auto-created Media',
+            year: 2024
+          }
+        } else {
+          requestBody.media_id = props.mediaId
+        }
+
+        const response = await fetch('/functions/v1/comments', {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${sessionToken}`,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify(requestBody)
+        })
+
+        const data = await response.json()
+
+        if (!response.ok) {
+          throw new Error(data.error)
+        }
+
+        emit('comment-created', data.comment)
+        content.value = ''
+      } catch (err) {
+        error.value = err instanceof Error ? err.message : 'Failed to post comment'
+      } finally {
+        submitting.value = false
+      }
+    }
+
+    return {
+      content,
+      submitting,
+      error,
+      createComment
+    }
+  }
+}
+```
+
+### Vanilla JavaScript API Client
+
+```javascript
+class CommentumAPI {
+  constructor(sessionToken) {
+    this.sessionToken = sessionToken
+  }
+
+  async createComment(options) {
+    const requestBody = {
+      action: 'create',
+      ...options
+    }
+
+    return this.makeRequest('/functions/v1/comments', {
+      method: 'POST',
+      body: JSON.stringify(requestBody)
+    })
+  }
+
+  async createCommentWithMedia(mediaInfo, content, parentId = null) {
+    return this.createComment({
+      media_info: mediaInfo,
+      content,
+      parent_id: parentId
+    })
+  }
+
+  async editComment(commentId, content) {
+    return this.makeRequest('/functions/v1/comments', {
+      method: 'POST',
+      body: JSON.stringify({
+        action: 'edit',
+        comment_id: commentId,
+        content
+      })
+    })
+  }
+
+  async deleteComment(commentId) {
+    return this.makeRequest('/functions/v1/comments', {
+      method: 'POST',
+      body: JSON.stringify({
+        action: 'delete',
+        comment_id: commentId
+      })
+    })
+  }
+
+  async makeRequest(endpoint, options = {}) {
+    if (!this.sessionToken) {
+      throw new Error('Not authenticated')
+    }
+
+    const response = await fetch(endpoint, {
+      ...options,
+      headers: {
+        'Authorization': `Bearer ${this.sessionToken}`,
+        'Content-Type': 'application/json',
+        ...options.headers
+      }
+    })
+
+    if (response.status === 401) {
+      localStorage.removeItem('commentum_session_token')
+      throw new Error('Session expired. Please log in again.')
+    }
+
+    return response.json()
+  }
+}
+
+// Usage
+const api = new CommentumAPI(localStorage.getItem('commentum_session_token'))
+
+// Create comment with auto media creation
+try {
+  const comment = await api.createCommentWithMedia(
+    {
+      external_id: '12345',
+      media_type: 'anime',
+      title: 'Attack on Titan',
+      year: 2013,
+      poster_url: 'https://example.com/poster.jpg'
+    },
+    'This is a great anime!'
+  )
+  
+  console.log('Comment created:', comment)
+  console.log('Media ID:', comment.media_id)
+} catch (error) {
+  console.error('Error:', error.message)
+}
 ```
 
 ## Rate Limiting
@@ -437,9 +679,42 @@ export const ModerationActions: React.FC<ModerationActionsProps> = ({
 - **Edits**: Included in comment rate limit
 - **Moderation Actions**: Exempt from rate limits for moderators
 
-## Security Considerations
+## 🔒 Security Considerations
 
+- **Session Authentication**: All requests require valid session tokens
+- **Zero-Trust Architecture**: No client-provided user data is trusted
 - **Input Sanitization**: All content is sanitized before storage
 - **Permission Checks**: All actions are validated against user permissions
 - **Audit Logging**: All actions are logged for moderation review
 - **Rate Limiting**: Prevents spam and abuse
+- **Auto Media Creation**: Prevents media ID spoofing by creating media server-side
+
+## 🚨 Breaking Changes from Previous Version
+
+### Before (Vulnerable)
+```javascript
+// ❌ Client could send any user_id
+fetch('/functions/v1/comments', {
+  body: JSON.stringify({
+    action: 'create',
+    user_id: 123,  // Could be faked!
+    media_id: 456,
+    content: 'Comment text'
+  })
+})
+```
+
+### After (Secure)
+```javascript
+// ✅ User ID extracted from session
+fetch('/functions/v1/comments', {
+  headers: { 'Authorization': `Bearer ${sessionToken}` },
+  body: JSON.stringify({
+    action: 'create',
+    media_id: 456,
+    content: 'Comment text'  // No user_id needed!
+  })
+})
+```
+
+This secure API ensures that comment operations can only be performed by authenticated users while providing powerful features like automatic media creation.

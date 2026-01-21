@@ -1,12 +1,14 @@
 # Authentication & Authorization Guide
 
-This guide covers the authentication and authorization system in Commentum, including identity resolution, role-based access control, and security best practices.
+This guide covers the secure session-based authentication and authorization system in Commentum, including token verification, session management, role-based access control, and security best practices.
 
 ## Table of Contents
 
 - [Overview](#overview)
-- [Identity System](#identity-system)
-- [Authentication Flow](#authentication-flow)
+- [Security Architecture](#security-architecture)
+- [Token-Based Authentication](#token-based-authentication)
+- [Session Management](#session-management)
+- [Identity Verification](#identity-verification)
 - [Role-Based Access Control](#role-based-access-control)
 - [Permission System](#permission-system)
 - [Security Implementation](#security-implementation)
@@ -14,317 +16,292 @@ This guide covers the authentication and authorization system in Commentum, incl
 
 ## Overview
 
-Commentum uses a flexible identity-based authentication system that supports multiple external platforms while maintaining a unified user management system.
+Commentum uses a **secure session-based authentication system** that prevents identity spoofing by verifying provider tokens and managing server-side sessions.
 
 ### Key Concepts
 
-- **Identity Resolution**: Maps external platform identities to internal users
+- **Token Verification**: All provider tokens are verified with respective APIs
+- **Session Management**: Secure server-side sessions with automatic expiry
+- **Zero-Trust Architecture**: No client-provided user data is trusted
 - **Multi-Platform Support**: AniList, MyAnimeList, SIMKL integration
 - **Role Hierarchy**: User → Moderator → Admin → Super Admin
 - **Row Level Security**: Database-level access control
-- **Session Management**: Stateless authentication with context passing
 
-## Identity System
+## Security Architecture
 
-### User vs Identity
+### 🚨 Critical Security Fix
 
-The system distinguishes between **Users** (internal accounts) and **Identities** (external platform accounts):
-
-```
-User (Internal Account)
-├── Identity 1: AniList (user_id: 12345)
-├── Identity 2: MyAnimeList (user_id: 67890)
-└── Identity 3: SIMKL (user_id: abcdef)
-```
-
-### Identity Resolution Process
-
-1. **External Authentication**: User authenticates with external platform
-2. **Identity Lookup**: System checks for existing identity record
-3. **User Linking**: 
-   - If identity exists → Return associated user
-   - If user with same username exists → Link identity to existing user
-   - If no match → Create new user and identity
-4. **Context Setting**: Set user context for subsequent requests
-
-### Supported Platforms
-
-| Platform | Client Type | Data Required | Notes |
-|----------|-------------|---------------|-------|
-| AniList | `anilist` | User ID, Username, Avatar | Popular anime/manga tracker |
-| MyAnimeList | `myanimelist` | User ID, Username, Avatar | Large anime community |
-| SIMKL | `simkl` | User ID, Username, Avatar | Universal media tracker |
-
-## Authentication Flow
-
-### 1. Platform Authentication
+The system prevents **identity spoofing attacks** that were possible in previous versions:
 
 ```typescript
-// Example: AniList OAuth Flow
-class AniListAuth {
-  private clientId: string
-  private clientSecret: string
-  private redirectUri: string
+// ❌ OLD VULNERABLE: Client could send any user_id
+const { user_id } = await resolveIdentity(...)
+fetch('/functions/v1/comments', {
+  body: JSON.stringify({ user_id, action: 'create' }) // DANGEROUS!
+})
 
-  async authenticate(): Promise<AniListUser> {
-    // 1. Redirect to AniList OAuth
-    const authUrl = `https://anilist.co/api/v2/oauth/authorize?client_id=${this.clientId}&redirect_uri=${this.redirectUri}`
-    
-    // 2. Handle callback and get authorization code
-    const code = await this.getAuthorizationCode()
-    
-    // 3. Exchange code for access token
-    const token = await this.exchangeCodeForToken(code)
-    
-    // 4. Get user profile
-    const user = await this.getUserProfile(token.access_token)
-    
-    return user
-  }
-  
-  private async exchangeCodeForToken(code: string) {
-    const response = await fetch('https://anilist.co/api/v2/oauth/token', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        grant_type: 'authorization_code',
-        client_id: this.clientId,
-        client_secret: this.clientSecret,
-        redirect_uri: this.redirectUri,
-        code
-      })
-    })
-    
-    return response.json()
-  }
-  
-  private async getUserProfile(accessToken: string) {
-    const response = await fetch('https://graphql.anilist.co', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${accessToken}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        query: `
-          query {
-            Viewer {
-              id
-              name
-              avatar {
-                large
-              }
+// ✅ NEW SECURE: Server validates session token
+const { session_token } = await authenticateUser(...)
+fetch('/functions/v1/comments', {
+  headers: { 'Authorization': `Bearer ${session_token}` },
+  body: JSON.stringify({ action: 'create' }) // SAFE!
+})
+```
+
+### Security Benefits
+
+- ✅ **Identity Spoofing Prevention**: Impossible to fake user IDs
+- ✅ **Real Token Verification**: All tokens verified with provider APIs
+- ✅ **Session Security**: Cryptographically secure session tokens
+- ✅ **Automatic Expiry**: 30-day session expiration with cleanup
+- ✅ **Zero-Trust**: No client-provided data trusted
+
+## Token-Based Authentication
+
+### Provider Token Verification
+
+Each platform's token is verified with its respective API:
+
+#### AniList Token Verification
+```typescript
+async function verifyAniListToken(token: string): Promise<UserInfo | null> {
+  const response = await fetch('https://graphql.anilist.co', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      query: `
+        query {
+          Viewer {
+            id
+            name
+            avatar {
+              large
             }
           }
-        `
-      })
+        }
+      `
     })
-    
-    const data = await response.json()
-    return data.data.Viewer
-  }
-}
-```
-
-### 2. Identity Resolution
-
-```typescript
-// services/identityService.ts
-export class IdentityService {
-  private apiClient: CommentumAPIClient
-
-  constructor(apiClient: CommentumAPIClient) {
-    this.apiClient = apiClient
-  }
-
-  async resolveIdentity(
-    platform: 'anilist' | 'myanimelist' | 'simkl',
-    externalUserId: string,
-    username: string,
-    avatarUrl?: string
-  ): Promise<UserIdentity> {
-    try {
-      const response = await this.apiClient.resolveIdentity({
-        client_type: platform,
-        client_user_id: externalUserId,
-        username,
-        avatar_url: avatarUrl
-      })
-
-      // Handle different user states
-      if (response.banned) {
-        throw new AuthError('Account is banned', 'BANNED')
-      }
-
-      if (response.muted_until && new Date(response.muted_until) > new Date()) {
-        throw new AuthError(`Account muted until ${response.muted_until}`, 'MUTED')
-      }
-
-      return response
-    } catch (error) {
-      if (error instanceof APIError) {
-        throw new AuthError(error.message, error.code)
-      }
-      throw error
-    }
-  }
-
-  async refreshIdentity(userId: number): Promise<UserIdentity> {
-    // Re-resolve identity to get updated user state
-    const response = await this.apiClient.request(`/users/${userId}`)
-    return response
-  }
-}
-
-class AuthError extends Error {
-  constructor(
-    message: string,
-    public code: string,
-    public statusCode?: number
-  ) {
-    super(message)
-    this.name = 'AuthError'
-  }
-}
-```
-
-### 3. Session Management
-
-```typescript
-// contexts/AuthContext.tsx
-interface AuthState {
-  user: UserIdentity | null
-  loading: boolean
-  error: string | null
-  isAuthenticated: boolean
-}
-
-interface AuthContextType extends AuthState {
-  login: (platform: string, credentials: any) => Promise<void>
-  logout: () => void
-  refreshUser: () => Promise<void>
-}
-
-export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) => {
-  const [state, setState] = useState<AuthState>({
-    user: null,
-    loading: false,
-    error: null,
-    isAuthenticated: false
   })
 
-  const identityService = useMemo(() => new IdentityService(commentumClient), [])
+  if (!response.ok) return null
+  
+  const data = await response.json()
+  if (data.errors) return null
 
-  const login = async (platform: string, credentials: any) => {
-    setState(prev => ({ ...prev, loading: true, error: null }))
-
-    try {
-      let platformUser: any
-
-      // Authenticate with platform
-      switch (platform) {
-        case 'anilist':
-          const anilistAuth = new AniListAuth()
-          platformUser = await anilistAuth.authenticate()
-          break
-        case 'myanimelist':
-          const malAuth = new MyAnimeListAuth()
-          platformUser = await malAuth.authenticate(credentials)
-          break
-        case 'simkl':
-          const simklAuth = new SimklAuth()
-          platformUser = await simklAuth.authenticate()
-          break
-        default:
-          throw new Error(`Unsupported platform: ${platform}`)
-      }
-
-      // Resolve identity with Commentum
-      const user = await identityService.resolveIdentity(
-        platform as any,
-        platformUser.id.toString(),
-        platformUser.name,
-        platformUser.avatar?.large
-      )
-
-      // Store session
-      localStorage.setItem('commentum_session', JSON.stringify({
-        user,
-        platform,
-        expiresAt: Date.now() + (24 * 60 * 60 * 1000) // 24 hours
-      }))
-
-      setState({
-        user,
-        loading: false,
-        error: null,
-        isAuthenticated: true
-      })
-    } catch (error) {
-      setState(prev => ({
-        ...prev,
-        loading: false,
-        error: error instanceof Error ? error.message : 'Authentication failed'
-      }))
-    }
+  const viewer = data.data.Viewer
+  return {
+    id: viewer.id.toString(),
+    username: viewer.name,
+    avatar_url: viewer.avatar?.large
   }
+}
+```
 
-  const logout = () => {
-    localStorage.removeItem('commentum_session')
-    setState({
-      user: null,
-      loading: false,
-      error: null,
-      isAuthenticated: false
+#### MyAnimeList Token Verification
+```typescript
+async function verifyMyAnimeListToken(token: string): Promise<UserInfo | null> {
+  const response = await fetch('https://api.myanimelist.net/v2/users/@me', {
+    method: 'GET',
+    headers: {
+      'Authorization': `Bearer ${token}`,
+    }
+  })
+
+  if (!response.ok) return null
+  
+  const data = await response.json()
+  return {
+    id: data.id.toString(),
+    username: data.name,
+    avatar_url: data.picture
+  }
+}
+```
+
+#### SIMKL Token Verification
+```typescript
+async function verifySimklToken(token: string): Promise<UserInfo | null> {
+  const response = await fetch('https://api.simkl.com/users/settings', {
+    method: 'GET',
+    headers: {
+      'simkl-api-key': token,
+    }
+  })
+
+  if (!response.ok) return null
+  
+  const userData = await response.json()
+  
+  return {
+    id: userData.user.id.toString(),
+    username: userData.user.name,
+    avatar_url: userData.user.avatar
+  }
+}
+```
+
+## Session Management
+
+### Session Creation
+
+```typescript
+// Generate cryptographically secure session token
+function generateSessionToken(): string {
+  const array = new Uint8Array(32)
+  crypto.getRandomValues(array)
+  return Array.from(array, byte => byte.toString(16).padStart(2, '0')).join('')
+}
+
+// Create session after successful token verification
+async function createSession(userId: number, clientType: string): Promise<SessionInfo> {
+  const sessionToken = generateSessionToken()
+  const expiresAt = new Date()
+  expiresAt.setDate(expiresAt.getDate() + 30) // 30 days
+
+  // Store session in database
+  await supabase
+    .from('user_sessions')
+    .insert({
+      user_id: userId,
+      session_token: sessionToken,
+      client_type: clientType,
+      expires_at: expiresAt.toISOString()
     })
+
+  return {
+    session_token: sessionToken,
+    expires_at: expiresAt.toISOString()
+  }
+}
+```
+
+### Session Verification
+
+```typescript
+// Verify session token on every API request
+async function verifySessionToken(sessionToken: string): Promise<SessionContext | null> {
+  // Clean up expired sessions first
+  await supabase
+    .from('user_sessions')
+    .delete()
+    .lt('expires_at', new Date().toISOString())
+
+  // Find valid session
+  const { data: session } = await supabase
+    .from('user_sessions')
+    .select(`
+      id,
+      user_id,
+      users (
+        id,
+        username,
+        role,
+        banned,
+        shadow_banned,
+        muted_until
+      )
+    `)
+    .eq('session_token', sessionToken)
+    .gt('expires_at', new Date().toISOString())
+    .single()
+
+  if (!session) return null
+
+  // Check if user is banned or muted
+  const user = session.users
+  if (user.banned || (user.muted_until && user.muted_until > new Date().toISOString())) {
+    return null
   }
 
-  const refreshUser = async () => {
-    if (!state.user) return
+  // Update last used time
+  await supabase
+    .from('user_sessions')
+    .update({ last_used_at: new Date().toISOString() })
+    .eq('id', session.id)
 
-    try {
-      const updatedUser = await identityService.refreshIdentity(state.user.user_id)
-      setState(prev => ({
-        ...prev,
-        user: updatedUser
-      }))
-    } catch (error) {
-      console.error('Failed to refresh user:', error)
-    }
+  return {
+    user: {
+      id: user.id,
+      username: user.username,
+      role: user.role,
+      banned: user.banned,
+      shadow_banned: user.shadow_banned,
+      muted_until: user.muted_until
+    },
+    session_id: session.id
+  }
+}
+```
+
+## Identity Verification
+
+### Authentication Flow
+
+```typescript
+// 1. Provider Authentication
+const authenticateUser = async (clientType: string, token: string) => {
+  // Verify token with provider
+  const userInfo = await verifyToken(clientType, token)
+  if (!userInfo) {
+    throw new Error('Invalid token or authentication failed')
   }
 
-  // Initialize session from storage
-  useEffect(() => {
-    const storedSession = localStorage.getItem('commentum_session')
-    if (storedSession) {
-      try {
-        const session = JSON.parse(storedSession)
-        if (session.expiresAt > Date.now()) {
-          setState({
-            user: session.user,
-            loading: false,
-            error: null,
-            isAuthenticated: true
-          })
-        } else {
-          logout()
-        }
-      } catch (error) {
-        logout()
-      }
-    }
-  }, [])
+  // 2. Identity Resolution
+  const response = await fetch('/functions/v1/identity-resolve', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      client_type: clientType,
+      token
+    })
+  })
 
-  return (
-    <AuthContext.Provider value={{
-      ...state,
-      login,
-      logout,
-      refreshUser
-    }}>
-      {children}
-    </AuthContext.Provider>
-  )
+  const result = await response.json()
+  
+  if (result.error) {
+    throw new Error(result.error)
+  }
+
+  // 3. Store Session Token
+  localStorage.setItem('commentum_session_token', result.session_token)
+  
+  return result.user
+}
+```
+
+### Session-Based API Calls
+
+```typescript
+// All subsequent API calls use session tokens
+const makeAuthenticatedRequest = async (endpoint: string, options: RequestInit = {}) => {
+  const sessionToken = localStorage.getItem('commentum_session_token')
+  
+  if (!sessionToken) {
+    throw new Error('Not authenticated')
+  }
+
+  const response = await fetch(endpoint, {
+    ...options,
+    headers: {
+      'Authorization': `Bearer ${sessionToken}`,
+      'Content-Type': 'application/json',
+      ...options.headers
+    }
+  })
+
+  // Handle session expiry
+  if (response.status === 401) {
+    localStorage.removeItem('commentum_session_token')
+    throw new Error('Session expired')
+  }
+
+  return response.json()
 }
 ```
 
@@ -394,50 +371,6 @@ const ROLE_HIERARCHY: Record<UserRole, RolePermissions> = {
 ### Permission Checking
 
 ```typescript
-// utils/permissions.ts
-type Permission = string // e.g., 'comment:create', 'user:ban'
-
-export class PermissionChecker {
-  private userRole: UserRole
-  private roleHierarchy: Record<UserRole, RolePermissions>
-
-  constructor(userRole: UserRole) {
-    this.userRole = userRole
-    this.roleHierarchy = ROLE_HIERARCHY
-  }
-
-  hasPermission(permission: Permission): boolean {
-    const rolePermissions = this.roleHierarchy[this.userRole]
-    return rolePermissions.permissions.includes(permission)
-  }
-
-  hasAnyPermission(permissions: Permission[]): boolean {
-    return permissions.some(permission => this.hasPermission(permission))
-  }
-
-  hasAllPermissions(permissions: Permission[]): boolean {
-    return permissions.every(permission => this.hasPermission(permission))
-  }
-
-  canTargetUser(targetRole: UserRole): boolean {
-    const userLevel = this.roleHierarchy[this.userRole].level
-    const targetLevel = this.roleHierarchy[targetRole].level
-    
-    // Super admins cannot be targeted
-    if (targetRole === UserRole.SUPER_ADMIN) {
-      return false
-    }
-    
-    // Can only target users with lower level (except super admin can target anyone)
-    return this.userRole === UserRole.SUPER_ADMIN || userLevel > targetLevel
-  }
-
-  getAvailableActions(): string[] {
-    const rolePermissions = this.roleHierarchy[this.userRole]
-    return rolePermissions.permissions
-  }
-}
-
 // React Hook for permissions
 export const usePermissions = (user?: UserIdentity | null) => {
   const permissionChecker = useMemo(() => {
@@ -464,64 +397,6 @@ export const usePermissions = (user?: UserIdentity | null) => {
     canAdmin
   }
 }
-```
-
-### Authorization Components
-
-```typescript
-// components/Authorization.tsx
-interface AuthorizationProps {
-  permission?: Permission
-  permissions?: Permission[]
-  role?: UserRole
-  roles?: UserRole[]
-  fallback?: ReactNode
-  children: ReactNode
-}
-
-export const Authorization: React.FC<AuthorizationProps> = ({
-  permission,
-  permissions,
-  role,
-  roles,
-  fallback = null,
-  children
-}) => {
-  const { user } = useAuth()
-
-  if (!user) {
-    return <>{fallback}</>
-  }
-
-  const checker = new PermissionChecker(user.role)
-
-  let isAuthorized = false
-
-  if (permission) {
-    isAuthorized = checker.hasPermission(permission)
-  } else if (permissions) {
-    isAuthorized = checker.hasAnyPermission(permissions)
-  } else if (role) {
-    isAuthorized = user.role === role
-  } else if (roles) {
-    isAuthorized = roles.includes(user.role)
-  }
-
-  return isAuthorized ? <>{children}</> : <>{fallback}</>
-}
-
-// Usage examples
-export const ModerationPanel = () => (
-  <Authorization permission="comment:delete:any" fallback={<p>Access denied</p>}>
-    <ModerationTools />
-  </Authorization>
-)
-
-export const AdminSettings = () => (
-  <Authorization roles={[UserRole.ADMIN, UserRole.SUPER_ADMIN]}>
-    <AdminPanel />
-  </Authorization>
-)
 ```
 
 ## Permission System
@@ -551,463 +426,425 @@ CREATE POLICY "Moderators can moderate comments" ON comments
     );
 ```
 
-### Context Setting
+### Session-Based Context Setting
 
 ```typescript
-// middleware/authMiddleware.ts
-export const setUserContext = async (userId: number, userRole: string) => {
-  await commentumAPI.request('/set-context', {
-    method: 'POST',
-    body: JSON.stringify({
-      user_id: userId.toString(),
-      user_role: userRole
-    })
+// Edge functions automatically set user context from session
+export const setUserContext = async (supabase: any, userId: number, userRole: string) => {
+  await supabase.rpc('set_user_context', { 
+    user_id: userId.toString(),
+    user_role: userRole
   })
-}
-
-// API request wrapper
-export const authenticatedRequest = async (
-  userId: number,
-  userRole: string,
-  endpoint: string,
-  options: RequestInit = {}
-) => {
-  // Set user context for RLS
-  await setUserContext(userId, userRole)
-  
-  // Make the actual request
-  return commentumAPI.request(endpoint, options)
-}
-```
-
-### Permission Validation
-
-```typescript
-// services/authorizationService.ts
-export class AuthorizationService {
-  async validateCommentAction(
-    userId: number,
-    userRole: string,
-    action: string,
-    commentId?: number,
-    targetUserId?: number
-  ): Promise<boolean> {
-    // Set user context
-    await setUserContext(userId, userRole)
-
-    try {
-      // Attempt the action to validate permissions
-      switch (action) {
-        case 'edit':
-          if (!commentId) return false
-          await commentumAPI.request(`/comments/${commentId}/validate-edit`, {
-            method: 'POST',
-            body: JSON.stringify({ user_id: userId })
-          })
-          break
-          
-        case 'delete':
-          if (!commentId) return false
-          await commentumAPI.request(`/comments/${commentId}/validate-delete`, {
-            method: 'POST',
-            body: JSON.stringify({ user_id: userId })
-          })
-          break
-          
-        case 'moderate':
-          if (!targetUserId) return false
-          await commentumAPI.request('/users/validate-moderation', {
-            method: 'POST',
-            body: JSON.stringify({
-              moderator_id: userId,
-              target_user_id: targetUserId
-            })
-          })
-          break
-          
-        default:
-          return false
-      }
-      
-      return true
-    } catch (error) {
-      return false
-    }
-  }
-
-  async canPerformAction(
-    user: UserIdentity,
-    action: string,
-    resource?: any
-  ): Promise<boolean> {
-    const checker = new PermissionChecker(user.role)
-    
-    // Check basic permission
-    if (!checker.hasPermission(action)) {
-      return false
-    }
-
-    // Check resource-specific permissions
-    if (resource) {
-      switch (action) {
-        case 'comment:edit:own':
-          return resource.user_id === user.user_id
-          
-        case 'user:moderate':
-          return checker.canTargetUser(resource.role)
-          
-        case 'report:resolve':
-          return resource.status === 'pending'
-      }
-    }
-
-    return true
-  }
 }
 ```
 
 ## Security Implementation
 
-### Token Security
+### Authentication Context
 
 ```typescript
-// utils/tokenSecurity.ts
-export class TokenSecurity {
-  private static readonly TOKEN_PREFIX = 'cm_' // Commentum token prefix
-  
-  static generateSessionToken(user: UserIdentity): string {
-    const payload = {
-      userId: user.user_id,
-      role: user.role,
-      timestamp: Date.now(),
-      // Add any other non-sensitive data
-    }
-    
-    const encoded = btoa(JSON.stringify(payload))
-    return `${this.TOKEN_PREFIX}${encoded}`
-  }
-  
-  static validateSessionToken(token: string): { valid: boolean; payload?: any } {
-    if (!token.startsWith(this.TOKEN_PREFIX)) {
-      return { valid: false }
-    }
-    
+// contexts/AuthContext.tsx
+interface AuthState {
+  user: UserIdentity | null
+  sessionToken: string | null
+  loading: boolean
+  error: string | null
+  isAuthenticated: boolean
+}
+
+export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) => {
+  const [state, setState] = useState<AuthState>({
+    user: null,
+    sessionToken: null,
+    loading: false,
+    error: null,
+    isAuthenticated: false
+  })
+
+  const login = async (clientType: string, token: string) => {
+    setState(prev => ({ ...prev, loading: true, error: null }))
+
     try {
-      const encoded = token.substring(this.TOKEN_PREFIX.length)
-      const payload = JSON.parse(atob(encoded))
+      const user = await authenticateUser(clientType, token)
       
-      // Check token age (24 hours)
-      const age = Date.now() - payload.timestamp
-      if (age > 24 * 60 * 60 * 1000) {
-        return { valid: false }
-      }
-      
-      return { valid: true, payload }
+      setState({
+        user,
+        sessionToken: localStorage.getItem('commentum_session_token'),
+        loading: false,
+        error: null,
+        isAuthenticated: true
+      })
     } catch (error) {
-      return { valid: false }
+      setState(prev => ({
+        ...prev,
+        loading: false,
+        error: error instanceof Error ? error.message : 'Authentication failed'
+      }))
     }
   }
-  
-  static hashUserId(userId: number): string {
-    // Hash user ID for client-side storage
-    return btoa(`user_${userId}_${Date.now()}`).substring(0, 16)
+
+  const logout = () => {
+    localStorage.removeItem('commentum_session_token')
+    setState({
+      user: null,
+      sessionToken: null,
+      loading: false,
+      error: null,
+      isAuthenticated: false
+    })
   }
-}
-```
 
-### Request Security
-
-```typescript
-// utils/requestSecurity.ts
-export class RequestSecurity {
-  private static readonly REQUEST_TIMEOUT = 10000 // 10 seconds
-  private static readonly MAX_RETRIES = 3
-  
-  static async secureRequest(
-    url: string,
-    options: RequestInit & { userId?: number; userRole?: string } = {}
-  ): Promise<Response> {
-    const { userId, userRole, ...fetchOptions } = options
-    
-    // Add security headers
-    const headers = {
-      'X-Requested-With': 'XMLHttpRequest',
-      'Cache-Control': 'no-cache',
-      'Pragma': 'no-cache',
-      ...fetchOptions.headers
-    }
-    
-    // Add user context if available
-    if (userId && userRole) {
-      headers['X-User-ID'] = userId.toString()
-      headers['X-User-Role'] = userRole
-    }
-    
-    let lastError: Error
-    
-    for (let attempt = 1; attempt <= this.MAX_RETRIES; attempt++) {
-      try {
-        const controller = new AbortController()
-        const timeoutId = setTimeout(() => controller.abort(), this.REQUEST_TIMEOUT)
-        
-        const response = await fetch(url, {
-          ...fetchOptions,
-          headers,
-          signal: controller.signal
+  // Initialize session from storage
+  useEffect(() => {
+    const sessionToken = localStorage.getItem('commentum_session_token')
+    if (sessionToken) {
+      // Validate session on app start
+      validateSession(sessionToken)
+        .then(user => {
+          if (user) {
+            setState({
+              user,
+              sessionToken,
+              loading: false,
+              error: null,
+              isAuthenticated: true
+            })
+          } else {
+            logout()
+          }
         })
-        
-        clearTimeout(timeoutId)
-        
-        // Check for security headers
-        const securityHeaders = response.headers.get('X-Security-Check')
-        if (securityHeaders) {
-          console.warn('Security check failed:', securityHeaders)
-        }
-        
-        return response
-      } catch (error) {
-        lastError = error as Error
-        
-        if (attempt === this.MAX_RETRIES) {
-          break
-        }
-        
-        // Exponential backoff
-        await new Promise(resolve => setTimeout(resolve, Math.pow(2, attempt) * 1000))
-      }
+        .catch(() => logout())
     }
-    
-    throw lastError!
-  }
+  }, [])
+
+  return (
+    <AuthContext.Provider value={{
+      ...state,
+      login,
+      logout
+    }}>
+      {children}
+    </AuthContext.Provider>
+  )
 }
 ```
 
-### CSRF Protection
+### API Client with Session Management
 
 ```typescript
-// utils/csrfProtection.ts
-export class CSRFProtection {
-  private static readonly TOKEN_KEY = 'csrf_token'
-  private static readonly HEADER_NAME = 'X-CSRF-Token'
-  
-  static generateToken(): string {
-    const array = new Uint8Array(32)
-    crypto.getRandomValues(array)
-    return Array.from(array, byte => byte.toString(16).padStart(2, '0')).join('')
+// services/apiClient.ts
+export class CommentumAPIClient {
+  private baseURL: string
+  private sessionToken: string | null = null
+
+  constructor(baseURL: string) {
+    this.baseURL = baseURL
   }
-  
-  static getToken(): string {
-    let token = localStorage.getItem(this.TOKEN_KEY)
+
+  setSessionToken(token: string) {
+    this.sessionToken = token
+  }
+
+  async request(endpoint: string, options: RequestInit = {}): Promise<any> {
+    const url = `${this.baseURL}${endpoint}`
     
-    if (!token) {
-      token = this.generateToken()
-      localStorage.setItem(this.TOKEN_KEY, token)
+    const headers = {
+      'Content-Type': 'application/json',
+      ...options.headers
     }
-    
-    return token
-  }
-  
-  static validateRequest(request: Request): boolean {
-    const token = request.headers.get(this.HEADER_NAME)
-    const storedToken = this.getToken()
-    
-    return token === storedToken
-  }
-  
-  static addTokenToRequest(options: RequestInit): RequestInit {
-    return {
+
+    // Add session token if available
+    if (this.sessionToken) {
+      headers['Authorization'] = `Bearer ${this.sessionToken}`
+    }
+
+    const response = await fetch(url, {
       ...options,
-      headers: {
-        ...options.headers,
-        [this.HEADER_NAME]: this.getToken()
-      }
+      headers
+    })
+
+    // Handle session expiry
+    if (response.status === 401) {
+      this.setSessionToken('')
+      throw new Error('Session expired')
     }
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}: ${response.statusText}`)
+    }
+
+    return response.json()
+  }
+
+  // API methods
+  async createComment(data: CreateCommentRequest) {
+    return this.request('/functions/v1/comments', {
+      method: 'POST',
+      body: JSON.stringify({
+        action: 'create',
+        ...data
+      })
+    })
+  }
+
+  async voteOnComment(commentId: number, voteType: 'upvote' | 'downvote') {
+    return this.request('/functions/v1/voting', {
+      method: 'POST',
+      body: JSON.stringify({
+        action: voteType,
+        comment_id: commentId
+      })
+    })
   }
 }
 ```
 
 ## Integration Examples
 
-### Complete Authentication Flow
+### React Integration
 
 ```typescript
-// components/AuthFlow.tsx
-export const AuthFlow: React.FC = () => {
-  const { login, loading, error } = useAuth()
-  const [selectedPlatform, setSelectedPlatform] = useState<string>('')
-  
-  const handlePlatformAuth = async (platform: string) => {
-    try {
-      await login(platform, {})
-    } catch (error) {
-      console.error('Authentication failed:', error)
+// hooks/useCommentum.ts
+export const useCommentum = () => {
+  const { user, sessionToken, login, logout } = useAuth()
+  const [apiClient] = useState(() => new CommentumAPIClient(API_BASE_URL))
+
+  // Update API client when session changes
+  useEffect(() => {
+    if (sessionToken) {
+      apiClient.setSessionToken(sessionToken)
     }
+  }, [sessionToken, apiClient])
+
+  const createComment = useCallback(async (
+    mediaId?: number,
+    mediaInfo?: MediaInfo,
+    content: string,
+    parentId?: number
+  ) => {
+    if (!user) throw new Error('Not authenticated')
+
+    return apiClient.createComment({
+      media_id: mediaId,
+      media_info: mediaInfo,
+      parent_id: parentId,
+      content
+    })
+  }, [user, apiClient])
+
+  const voteOnComment = useCallback(async (
+    commentId: number,
+    voteType: 'upvote' | 'downvote'
+  ) => {
+    if (!user) throw new Error('Not authenticated')
+
+    return apiClient.voteOnComment(commentId, voteType)
+  }, [user, apiClient])
+
+  return {
+    user,
+    login,
+    logout,
+    createComment,
+    voteOnComment
   }
-  
-  return (
-    <div className="auth-flow">
-      <h2>Sign in with your favorite platform</h2>
-      
-      <div className="platform-options">
-        <button 
-          onClick={() => handlePlatformAuth('anilist')}
-          disabled={loading}
-        >
-          <img src="/anilist-logo.png" alt="AniList" />
-          Sign in with AniList
-        </button>
-        
-        <button 
-          onClick={() => handlePlatformAuth('myanimelist')}
-          disabled={loading}
-        >
-          <img src="/mal-logo.png" alt="MyAnimeList" />
-          Sign in with MyAnimeList
-        </button>
-        
-        <button 
-          onClick={() => handlePlatformAuth('simkl')}
-          disabled={loading}
-        >
-          <img src="/simkl-logo.png" alt="SIMKL" />
-          Sign in with SIMKL
-        </button>
-      </div>
-      
-      {loading && <div>Authenticating...</div>}
-      {error && <div className="error">{error}</div>}
-    </div>
-  )
 }
 ```
 
-### Protected Routes
+### Vanilla JavaScript Integration
 
-```typescript
-// components/ProtectedRoute.tsx
-interface ProtectedRouteProps {
-  children: ReactNode
-  requiredPermission?: Permission
-  requiredRole?: UserRole
-  fallback?: ReactNode
-}
+```javascript
+// services/commentum.js
+class CommentumService {
+  constructor(baseURL) {
+    this.baseURL = baseURL
+    this.sessionToken = localStorage.getItem('commentum_session_token')
+  }
 
-export const ProtectedRoute: React.FC<ProtectedRouteProps> = ({
-  children,
-  requiredPermission,
-  requiredRole,
-  fallback = <div>Access denied</div>
-}) => {
-  const { isAuthenticated, user, loading } = useAuth()
-  
-  if (loading) {
-    return <div>Loading...</div>
-  }
-  
-  if (!isAuthenticated || !user) {
-    return <AuthFlow />
-  }
-  
-  if (requiredPermission && !new PermissionChecker(user.role).hasPermission(requiredPermission)) {
-    return <>{fallback}</>
-  }
-  
-  if (requiredRole && user.role !== requiredRole) {
-    return <>{fallback}</>
-  }
-  
-  return <>{children}</>
-}
+  async authenticate(clientType, token) {
+    const response = await fetch(`${this.baseURL}/functions/v1/identity-resolve`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${ANON_KEY}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        client_type: clientType,
+        token
+      })
+    })
 
-// Usage in app routing
-const AppRoutes = () => (
-  <Router>
-    <Route path="/" element={<HomePage />} />
-    <Route path="/media/:id" element={<MediaPage />} />
+    const result = await response.json()
     
-    <Route 
-      path="/moderation" 
-      element={
-        <ProtectedRoute requiredPermission="comment:delete:any">
-          <ModerationPage />
-        </ProtectedRoute>
-      } 
-    />
-    
-    <Route 
-      path="/admin" 
-      element={
-        <ProtectedRoute requiredRole={UserRole.ADMIN}>
-          <AdminPage />
-        </ProtectedRoute>
-      } 
-    />
-  </Router>
-)
-```
-
-### API Client with Auth
-
-```typescript
-// lib/authenticatedApiClient.ts
-export class AuthenticatedAPIClient extends CommentumAPIClient {
-  private getUserId(): number | null {
-    const session = localStorage.getItem('commentum_session')
-    if (!session) return null
-    
-    const parsed = JSON.parse(session)
-    return parsed.user?.user_id || null
-  }
-  
-  private getUserRole(): string | null {
-    const session = localStorage.getItem('commentum_session')
-    if (!session) return null
-    
-    const parsed = JSON.parse(session)
-    return parsed.user?.role || null
-  }
-  
-  protected async request<T>(endpoint: string, options: RequestInit = {}): Promise<T> {
-    const userId = this.getUserId()
-    const userRole = this.getUserRole()
-    
-    if (!userId || !userRole) {
-      throw new AuthError('Not authenticated', 'NOT_AUTHENTICATED')
+    if (result.error) {
+      throw new Error(result.error)
     }
+
+    this.sessionToken = result.session_token
+    localStorage.setItem('commentum_session_token', result.session_token)
     
-    // Add user context to request
-    const authOptions = {
+    return result.user
+  }
+
+  async makeRequest(endpoint, options = {}) {
+    if (!this.sessionToken) {
+      throw new Error('Not authenticated')
+    }
+
+    const response = await fetch(`${this.baseURL}${endpoint}`, {
       ...options,
       headers: {
-        ...options.headers,
-        'X-User-ID': userId.toString(),
-        'X-User-Role': userRole
+        'Authorization': `Bearer ${this.sessionToken}`,
+        'Content-Type': 'application/json',
+        ...options.headers
       }
+    })
+
+    if (response.status === 401) {
+      this.sessionToken = null
+      localStorage.removeItem('commentum_session_token')
+      throw new Error('Session expired')
     }
-    
-    return super.request(endpoint, authOptions)
+
+    return response.json()
   }
-  
-  // Authenticated methods
-  async createComment(params: CreateCommentParams) {
-    return this.request('/comments', {
+
+  async createComment(data) {
+    return this.makeRequest('/functions/v1/comments', {
       method: 'POST',
       body: JSON.stringify({
         action: 'create',
-        ...params
+        ...data
       })
     })
   }
-  
-  async moderateUser(params: ModerateUserParams) {
-    return this.request('/moderation', {
-      method: 'POST',
-      body: JSON.stringify(params)
-    })
+
+  logout() {
+    this.sessionToken = null
+    localStorage.removeItem('commentum_session_token')
   }
 }
 
-export const authenticatedClient = new AuthenticatedAPIClient()
+// Usage
+const commentum = new CommentumService('https://your-project.supabase.co')
+
+// Authenticate with AniList
+try {
+  const user = await commentum.authenticate('anilist', 'your_anilist_token')
+  console.log('Authenticated as:', user.username)
+  
+  // Create comment
+  const comment = await commentum.createComment({
+    media_info: {
+      external_id: '12345',
+      media_type: 'anime',
+      title: 'Attack on Titan'
+    },
+    content: 'Great anime!'
+  })
+  
+  console.log('Comment created:', comment)
+} catch (error) {
+  console.error('Error:', error.message)
+}
 ```
 
-This authentication and authorization guide provides a comprehensive framework for implementing secure user management in Commentum. The system is designed to be flexible, secure, and easy to integrate with various frontend frameworks.
+### Vue.js Integration
+
+```typescript
+// composables/useCommentum.ts
+export const useCommentum = () => {
+  const { session } = useAuth()
+  const apiClient = new CommentumAPIClient(API_BASE_URL)
+
+  watch(session, (newSession) => {
+    if (newSession?.token) {
+      apiClient.setSessionToken(newSession.token)
+    }
+  }, { immediate: true })
+
+  const createComment = async (data: CreateCommentRequest) => {
+    if (!session.value) {
+      throw new Error('Not authenticated')
+    }
+
+    return apiClient.createComment(data)
+  }
+
+  const voteOnComment = async (commentId: number, voteType: string) => {
+    if (!session.value) {
+      throw new Error('Not authenticated')
+    }
+
+    return apiClient.voteOnComment(commentId, voteType)
+  }
+
+  return {
+    createComment,
+    voteOnComment
+  }
+}
+```
+
+## Security Best Practices
+
+### Frontend Security
+
+```typescript
+// 1. Never store tokens in URL parameters
+// ❌ BAD
+window.location.hash = `#token=${sessionToken}`
+
+// ✅ GOOD
+localStorage.setItem('commentum_session_token', sessionToken)
+
+// 2. Use HTTPS for all API calls
+// 3. Validate session on app start
+// 4. Clear session on logout
+// 5. Handle session expiry gracefully
+```
+
+### Backend Security
+
+```typescript
+// 1. Always verify session tokens
+const authResult = await authenticateRequest(req)
+if (authResult.response) {
+  return authResult.response
+}
+
+// 2. Use RLS policies
+await setUserContext(supabase, user.id, user.role)
+
+// 3. Log all actions
+await supabase
+  .from('moderation_actions')
+  .insert({
+    moderator_id: user.id,
+    action_type: 'create_comment',
+    action_details: { media_id: finalMediaId }
+  })
+```
+
+### Session Management
+
+```typescript
+// 1. Generate cryptographically secure tokens
+function generateSessionToken(): string {
+  const array = new Uint8Array(32)
+  crypto.getRandomValues(array)
+  return Array.from(array, byte => byte.toString(16).padStart(2, '0')).join('')
+}
+
+// 2. Set reasonable expiry (30 days)
+const expiresAt = new Date()
+expiresAt.setDate(expiresAt.getDate() + 30)
+
+// 3. Clean up expired sessions
+await supabase
+  .from('user_sessions')
+  .delete()
+  .lt('expires_at', new Date().toISOString())
+```
+
+This secure authentication system ensures that user identities cannot be spoofed while providing a seamless experience for legitimate users.

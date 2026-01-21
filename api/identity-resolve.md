@@ -1,11 +1,15 @@
 # Identity Resolution API
 
-The Identity Resolution API handles user authentication and identity management across multiple platforms (AniList, MyAnimeList, SIMKL).
+The Identity Resolution API handles secure token-based authentication and session management across multiple platforms (AniList, MyAnimeList, SIMKL).
+
+## 🔒 Security Overview
+
+**CRITICAL**: This API uses token-based authentication to prevent identity spoofing. Unlike previous versions, it no longer trusts client-provided user IDs.
 
 ## Endpoint
 
 ```
-POST /identity-resolve
+POST /functions/v1/identity-resolve
 ```
 
 ## Request Body
@@ -13,10 +17,7 @@ POST /identity-resolve
 ```typescript
 interface IdentityRequest {
   client_type: 'anilist' | 'myanimelist' | 'simkl'
-  client_user_id: string
-  username: string
-  avatar_url?: string
-  verification_token?: string
+  token: string
 }
 ```
 
@@ -25,10 +26,7 @@ interface IdentityRequest {
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `client_type` | string | Yes | The platform identifier ('anilist', 'myanimelist', 'simkl') |
-| `client_user_id` | string | Yes | User ID from the external platform |
-| `username` | string | Yes | Username from the external platform |
-| `avatar_url` | string | No | Profile image URL |
-| `verification_token` | string | No | Token for identity verification |
+| `token` | string | Yes | OAuth token from the external platform |
 
 ## Response
 
@@ -36,12 +34,16 @@ interface IdentityRequest {
 
 ```typescript
 interface IdentityResponse {
-  user_id: number
-  username: string
-  role: 'user' | 'moderator' | 'admin' | 'super_admin'
-  banned: boolean
-  shadow_banned: boolean
-  muted_until: string | null
+  session_token: string
+  expires_at: string
+  user: {
+    id: number
+    username: string
+    role: 'user' | 'moderator' | 'admin' | 'super_admin'
+    banned: boolean
+    shadow_banned: boolean
+    muted_until: string | null
+  }
   existing_user: boolean
 }
 ```
@@ -51,7 +53,14 @@ interface IdentityResponse {
 #### 400 Bad Request
 ```json
 {
-  "error": "Missing required fields: client_type, client_user_id, username"
+  "error": "Missing required fields: client_type, token"
+}
+```
+
+#### 401 Unauthorized
+```json
+{
+  "error": "Invalid token or authentication failed"
 }
 ```
 
@@ -71,153 +80,444 @@ interface IdentityResponse {
 }
 ```
 
-## Behavior
+## 🔐 Authentication Flow
 
-### User Resolution Flow
+### 1. Token Verification
 
-1. **Check Existing Identity**: The system first checks if an identity already exists for the given `client_type` and `client_user_id`.
+The API verifies the provided token with the respective platform:
 
-2. **User Status Validation**: If the user exists, the system checks:
-   - If the user is banned or muted
-   - Updates identity information if username/avatar has changed
-
-3. **User Linking**: If no identity exists but a user with the same username exists, the new identity is linked to the existing user.
-
-4. **New User Creation**: If no matching user is found, a new user account is created with the 'user' role.
-
-### Identity Management
-
-- **Multiple Identities**: A single user can have multiple identities across different platforms
-- **Username Updates**: Identity information is automatically updated when changes are detected
-- **Cross-Platform Linking**: Users are linked by username across platforms
-
-## Usage Examples
-
-### Basic Identity Resolution
-
-```javascript
-const resolveIdentity = async (platform, userId, username, avatar) => {
-  const response = await fetch('/identity-resolve', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      client_type: platform,
-      client_user_id: userId,
-      username: username,
-      avatar_url: avatar
-    })
-  });
-
-  if (!response.ok) {
-    const error = await response.json();
-    throw new Error(error.error);
+#### AniList Token Verification
+```graphql
+query {
+  Viewer {
+    id
+    name
+    avatar {
+      large
+    }
   }
-
-  return await response.json();
-};
-
-// Example usage
-const userInfo = await resolveIdentity(
-  'anilist',
-  '5724017',
-  'ASheby',
-  'https://example.com/avatar.jpg'
-);
-
-console.log(`User ID: ${userInfo.user_id}, Role: ${userInfo.role}`);
-```
-
-### Error Handling
-
-```javascript
-try {
-  const userInfo = await resolveIdentity('anilist', '5724017', 'ASheby');
-  
-  if (userInfo.banned) {
-    console.error('User is banned');
-    return;
-  }
-  
-  if (userInfo.muted_until && new Date(userInfo.muted_until) > new Date()) {
-    console.error(`User is muted until ${userInfo.muted_until}`);
-    return;
-  }
-  
-  // Proceed with user session
-  console.log('Identity resolved successfully:', userInfo);
-  
-} catch (error) {
-  console.error('Identity resolution failed:', error.message);
 }
 ```
 
-### React Hook Example
+#### MyAnimeList Token Verification
+```http
+GET https://api.myanimelist.net/v2/users/@me
+Authorization: Bearer <token>
+```
+
+#### SIMKL Token Verification
+```http
+GET https://api.simkl.com/users/settings
+simkl-api-key: <token>
+```
+
+### 2. Session Creation
+
+After successful token verification, the API creates a secure session:
 
 ```typescript
-import { useState, useCallback } from 'react';
-
-interface UseIdentityResult {
-  resolveIdentity: (platform: string, userId: string, username: string, avatar?: string) => Promise<void>;
-  user: IdentityResponse | null;
-  loading: boolean;
-  error: string | null;
+// Generate cryptographically secure session token
+function generateSessionToken(): string {
+  const array = new Uint8Array(32)
+  crypto.getRandomValues(array)
+  return Array.from(array, byte => byte.toString(16).padStart(2, '0')).join('')
 }
 
-export const useIdentity = (): UseIdentityResult => {
-  const [user, setUser] = useState<IdentityResponse | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  const resolveIdentity = useCallback(async (
-    platform: string,
-    userId: string,
-    username: string,
-    avatar?: string
-  ) => {
-    setLoading(true);
-    setError(null);
-
-    try {
-      const response = await fetch('/identity-resolve', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          client_type: platform,
-          client_user_id: userId,
-          username,
-          avatar_url: avatar
-        })
-      });
-
-      const data = await response.json();
-
-      if (!response.ok) {
-        throw new Error(data.error);
-      }
-
-      setUser(data);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Unknown error');
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  return { resolveIdentity, user, loading, error };
-};
+// 30-day expiry
+const expiresAt = new Date()
+expiresAt.setDate(expiresAt.getDate() + 30)
 ```
 
-## Security Considerations
+### 3. User Resolution Flow
 
-- **Input Validation**: All inputs are validated for type and format
-- **Rate Limiting**: Identity resolution is subject to rate limiting
-- **No Sensitive Data**: The API never returns sensitive information like passwords or tokens
+1. **Token Verification**: Verify token with external platform API
+2. **Identity Lookup**: Check if identity already exists for the platform and user ID
+3. **User Status Validation**: Check if user is banned or muted
+4. **Session Creation**: Create new session or update existing one
+5. **Response**: Return session token and user information
 
-## Integration Notes
+## 🚀 Usage Examples
 
-- This endpoint should be called once per user session to establish identity
-- Store the returned `user_id` for subsequent API calls
-- Handle banned/muted states appropriately in your UI
-- Consider implementing caching to reduce API calls for the same user
+### Basic Authentication
+
+```javascript
+const authenticateUser = async (clientType, token) => {
+  const response = await fetch('/functions/v1/identity-resolve', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      client_type: clientType,
+      token
+    })
+  })
+
+  const result = await response.json()
+  
+  if (result.error) {
+    throw new Error(result.error)
+  }
+
+  // Store session token for subsequent API calls
+  localStorage.setItem('commentum_session_token', result.session_token)
+  
+  return result.user
+}
+
+// Example usage with AniList
+try {
+  const user = await authenticateUser('anilist', 'your_anilist_oauth_token')
+  console.log('Authenticated as:', user.username)
+  console.log('Session expires:', result.expires_at)
+} catch (error) {
+  console.error('Authentication failed:', error.message)
+}
+```
+
+### React Hook Implementation
+
+```typescript
+import { useState, useCallback } from 'react'
+
+interface AuthState {
+  user: UserIdentity | null
+  sessionToken: string | null
+  loading: boolean
+  error: string | null
+  isAuthenticated: boolean
+}
+
+export const useAuth = () => {
+  const [state, setState] = useState<AuthState>({
+    user: null,
+    sessionToken: localStorage.getItem('commentum_session_token'),
+    loading: false,
+    error: null,
+    isAuthenticated: false
+  })
+
+  const login = useCallback(async (clientType: string, token: string) => {
+    setState(prev => ({ ...prev, loading: true, error: null }))
+
+    try {
+      const response = await fetch('/functions/v1/identity-resolve', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          client_type: clientType,
+          token
+        })
+      })
+
+      const result = await response.json()
+      
+      if (result.error) {
+        throw new Error(result.error)
+      }
+
+      // Store session
+      localStorage.setItem('commentum_session_token', result.session_token)
+      
+      setState({
+        user: result.user,
+        sessionToken: result.session_token,
+        loading: false,
+        error: null,
+        isAuthenticated: true
+      })
+    } catch (error) {
+      setState(prev => ({
+        ...prev,
+        loading: false,
+        error: error instanceof Error ? error.message : 'Authentication failed'
+      }))
+    }
+  }, [])
+
+  const logout = useCallback(() => {
+    localStorage.removeItem('commentum_session_token')
+    setState({
+      user: null,
+      sessionToken: null,
+      loading: false,
+      error: null,
+      isAuthenticated: false
+    })
+  }, [])
+
+  return {
+    ...state,
+    login,
+    logout
+  }
+}
+```
+
+### Vue.js Implementation
+
+```typescript
+import { ref, computed } from 'vue'
+
+export const useAuth = () => {
+  const sessionToken = ref(localStorage.getItem('commentum_session_token'))
+  const user = ref(null)
+  const loading = ref(false)
+  const error = ref(null)
+
+  const isAuthenticated = computed(() => !!sessionToken.value && !!user.value)
+
+  const login = async (clientType: string, token: string) => {
+    loading.value = true
+    error.value = null
+
+    try {
+      const response = await fetch('/functions/v1/identity-resolve', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${import.meta.env.VITE_SUPABASE_ANON_KEY}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          client_type: clientType,
+          token
+        })
+      })
+
+      const result = await response.json()
+      
+      if (result.error) {
+        throw new Error(result.error)
+      }
+
+      sessionToken.value = result.session_token
+      user.value = result.user
+      localStorage.setItem('commentum_session_token', result.session_token)
+    } catch (err) {
+      error.value = err instanceof Error ? err.message : 'Authentication failed'
+    } finally {
+      loading.value = false
+    }
+  }
+
+  const logout = () => {
+    sessionToken.value = null
+    user.value = null
+    localStorage.removeItem('commentum_session_token')
+  }
+
+  return {
+    sessionToken,
+    user,
+    loading,
+    error,
+    isAuthenticated,
+    login,
+    logout
+  }
+}
+```
+
+### Vanilla JavaScript Implementation
+
+```javascript
+class CommentumAuth {
+  constructor() {
+    this.sessionToken = localStorage.getItem('commentum_session_token')
+    this.user = null
+  }
+
+  async authenticate(clientType, token) {
+    try {
+      const response = await fetch('/functions/v1/identity-resolve', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          client_type: clientType,
+          token
+        })
+      })
+
+      const result = await response.json()
+      
+      if (result.error) {
+        throw new Error(result.error)
+      }
+
+      this.sessionToken = result.session_token
+      this.user = result.user
+      localStorage.setItem('commentum_session_token', result.session_token)
+      
+      return result.user
+    } catch (error) {
+      console.error('Authentication failed:', error.message)
+      throw error
+    }
+  }
+
+  logout() {
+    this.sessionToken = null
+    this.user = null
+    localStorage.removeItem('commentum_session_token')
+  }
+
+  isAuthenticated() {
+    return !!this.sessionToken && !!this.user
+  }
+
+  makeAuthenticatedRequest(endpoint, options = {}) {
+    if (!this.sessionToken) {
+      throw new Error('Not authenticated')
+    }
+
+    return fetch(endpoint, {
+      ...options,
+      headers: {
+        'Authorization': `Bearer ${this.sessionToken}`,
+        'Content-Type': 'application/json',
+        ...options.headers
+      }
+    })
+  }
+}
+
+// Usage
+const auth = new CommentumAuth()
+
+// Authenticate
+try {
+  await auth.authenticate('anilist', 'your_oauth_token')
+  console.log('Authenticated successfully!')
+  
+  // Make authenticated request
+  const response = await auth.makeAuthenticatedRequest('/functions/v1/comments', {
+    method: 'POST',
+    body: JSON.stringify({
+      action: 'create',
+      media_info: {
+        external_id: '12345',
+        media_type: 'anime',
+        title: 'Attack on Titan'
+      },
+      content: 'Great anime!'
+    })
+  })
+  
+  console.log('Comment created:', response)
+} catch (error) {
+  console.error('Error:', error.message)
+}
+```
+
+## 🔒 Security Features
+
+### Token Verification
+- ✅ All tokens are verified with respective provider APIs
+- ✅ Invalid or expired tokens are rejected
+- ✅ Real user information is fetched from providers
+
+### Session Management
+- ✅ Cryptographically secure session tokens
+- ✅ 30-day automatic expiry
+- ✅ Server-side session validation
+- ✅ Automatic cleanup of expired sessions
+
+### Identity Protection
+- ✅ Prevents user ID spoofing attacks
+- ✅ Zero-trust architecture
+- ✅ Real authentication on every request
+
+## 📊 Session Management
+
+### Session Storage
+```sql
+CREATE TABLE user_sessions (
+  id SERIAL PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  session_token TEXT NOT NULL UNIQUE,
+  client_type TEXT NOT NULL,
+  expires_at TIMESTAMPTZ NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  last_used_at TIMESTAMPTZ DEFAULT NOW()
+);
+```
+
+### Session Lifecycle
+1. **Creation**: Generated after successful token verification
+2. **Validation**: Verified on every API request
+3. **Expiry**: Automatically expires after 30 days
+4. **Cleanup**: Expired sessions are automatically removed
+
+## 🚨 Breaking Changes from Previous Version
+
+### Before (Vulnerable)
+```javascript
+// ❌ Client could send any user_id
+const response = await fetch('/functions/v1/identity-resolve', {
+  body: JSON.stringify({
+    client_type: 'anilist',
+    client_user_id: '12345',  // Could be faked!
+    username: 'fake_user'
+  })
+})
+```
+
+### After (Secure)
+```javascript
+// ✅ Token must be verified with provider
+const response = await fetch('/functions/v1/identity-resolve', {
+  body: JSON.stringify({
+    client_type: 'anilist',
+    token: 'real_oauth_token'  // Must be valid!
+  })
+})
+```
+
+## 🔧 Integration Notes
+
+### Frontend Changes Required
+1. **Remove user_id parameters** from all API calls
+2. **Store session tokens** instead of user IDs
+3. **Use Authorization headers** for all subsequent requests
+4. **Handle session expiry** gracefully
+
+### Migration Steps
+1. Update authentication flow to use tokens
+2. Replace user_id-based API calls with session-based calls
+3. Update error handling for session expiry
+4. Test with real provider tokens
+
+### Error Handling
+```javascript
+const makeRequest = async (endpoint, options = {}) => {
+  try {
+    const response = await fetch(endpoint, {
+      ...options,
+      headers: {
+        'Authorization': `Bearer ${sessionToken}`,
+        ...options.headers
+      }
+    })
+
+    if (response.status === 401) {
+      // Session expired
+      localStorage.removeItem('commentum_session_token')
+      throw new Error('Session expired. Please log in again.')
+    }
+
+    return response.json()
+  } catch (error) {
+    console.error('Request failed:', error.message)
+    throw error
+  }
+}
+```
+
+This secure authentication system ensures that user identities cannot be spoofed while providing a seamless experience for legitimate users.
