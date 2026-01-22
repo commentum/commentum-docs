@@ -1,17 +1,288 @@
-# Troubleshooting Guide
+# 🔒 Troubleshooting Guide - Session-Based Authentication
 
-This guide covers common issues, error scenarios, and solutions for implementing and maintaining the Commentum system.
+This guide covers common issues, error scenarios, and solutions for implementing and maintaining the Commentum system with **secure session-based authentication**.
+
+## 🚨 **SECURITY UPDATE**
+
+**Previous troubleshooting methods contained vulnerable authentication patterns. This guide uses the new secure session-based authentication system.**
 
 ## Table of Contents
 
+- [🔒 Session Authentication Issues](#-session-authentication-issues)
 - [Common API Issues](#common-api-issues)
 - [Database Problems](#database-problems)
-- [Authentication Issues](#authentication-issues)
 - [Frontend Integration Problems](#frontend-integration-problems)
 - [Performance Issues](#performance-issues)
 - [Security Issues](#security-issues)
 - [Debugging Tools](#debugging-tools)
 - [FAQ](#faq)
+
+## 🔒 Session Authentication Issues
+
+### 1. Session Token Problems
+
+**Problem**: Users cannot authenticate or get "Session expired" errors frequently
+
+**Common Causes**:
+- Missing session token in localStorage
+- Invalid session token format
+- Session token expired
+- Server-side session validation failures
+
+**Debugging Steps**:
+```typescript
+// Check session token status
+function debugSessionToken() {
+  const token = localStorage.getItem('commentum_session_token')
+  console.log('Session token exists:', !!token)
+  console.log('Session token format:', token ? /^[a-f0-9]{64}$/.test(token) : 'invalid')
+  console.log('Session token length:', token?.length || 0)
+  
+  if (!token) {
+    console.error('No session token found - user needs to login')
+    return false
+  }
+  
+  return true
+}
+
+// Test session validation
+async function testSessionValidation() {
+  const token = localStorage.getItem('commentum_session_token')
+  if (!token) return false
+  
+  try {
+    const response = await fetch('/functions/v1/comments', {
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'Content-Type': 'application/json'
+      }
+    })
+    
+    if (response.status === 401) {
+      console.error('Session validation failed - token expired or invalid')
+      localStorage.removeItem('commentum_session_token')
+      return false
+    }
+    
+    console.log('Session validation successful')
+    return true
+  } catch (error) {
+    console.error('Session validation error:', error)
+    return false
+  }
+}
+```
+
+**Solutions**:
+```typescript
+// Implement proper session management
+class SessionManager {
+  constructor() {
+    this.storageKey = 'commentum_session_token'
+    this.validateTokenOnLoad = true
+  }
+
+  setSessionToken(token: string) {
+    // Validate token format before storing
+    if (!/^[a-f0-9]{64}$/.test(token)) {
+      throw new Error('Invalid session token format')
+    }
+    
+    localStorage.setItem(this.storageKey, token)
+    console.log('Session token stored successfully')
+  }
+
+  getSessionToken(): string | null {
+    const token = localStorage.getItem(this.storageKey)
+    
+    if (!token) {
+      console.log('No session token found')
+      return null
+    }
+    
+    // Validate token format
+    if (!/^[a-f0-9]{64}$/.test(token)) {
+      console.error('Invalid session token format, clearing...')
+      this.clearSessionToken()
+      return null
+    }
+    
+    return token
+  }
+
+  clearSessionToken() {
+    localStorage.removeItem(this.storageKey)
+    console.log('Session token cleared')
+  }
+
+  async validateSession(): Promise<boolean> {
+    const token = this.getSessionToken()
+    if (!token) return false
+    
+    try {
+      const response = await fetch('/functions/v1/comments', {
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Content-Type': 'application/json'
+        }
+      })
+      
+      if (response.status === 401) {
+        this.clearSessionToken()
+        return false
+      }
+      
+      return true
+    } catch (error) {
+      console.error('Session validation error:', error)
+      this.clearSessionToken()
+      return false
+    }
+  }
+}
+```
+
+### 2. Identity Resolution Failures
+
+**Problem**: Users cannot authenticate with external providers
+
+**Debugging**:
+```typescript
+// Debug identity resolution with real provider validation
+async function debugIdentityResolution(clientType: string, providerToken: string) {
+  console.log('=== Identity Resolution Debug ===')
+  console.log('Client Type:', clientType)
+  console.log('Provider Token Length:', providerToken.length)
+  console.log('Provider Token Prefix:', providerToken.substring(0, 10) + '...')
+  
+  try {
+    const response = await fetch('/functions/v1/identity-resolve', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        client_type: clientType,
+        token: providerToken
+      })
+    })
+
+    console.log('Response Status:', response.status)
+    console.log('Response Headers:', Object.fromEntries(response.headers.entries()))
+
+    if (!response.ok) {
+      const error = await response.json()
+      console.error('Identity Resolution Error:', error)
+      return { success: false, error }
+    }
+
+    const data = await response.json()
+    console.log('Identity Resolution Success:', data)
+    
+    // Validate response structure
+    if (!data.session_token || !data.user) {
+      console.error('Invalid response structure:', data)
+      return { success: false, error: 'Invalid response structure' }
+    }
+
+    return { success: true, data }
+  } catch (error) {
+    console.error('Identity Resolution Exception:', error)
+    return { success: false, error: error.message }
+  }
+}
+```
+
+**Common Issues**:
+- Invalid provider token (expired, revoked, incorrect format)
+- Network connectivity issues with provider APIs
+- Rate limiting from provider APIs
+- Incorrect client_type values
+
+### 3. Session Expiration Handling
+
+**Problem**: Users are logged out unexpectedly
+
+**Solutions**:
+```typescript
+// Implement proactive session refresh
+class SessionRefreshManager {
+  constructor(sessionManager, authContext) {
+    this.sessionManager = sessionManager
+    this.authContext = authContext
+    this.refreshInterval = null
+    this.warningShown = false
+  }
+
+  startProactiveRefresh() {
+    // Check session every 5 minutes
+    this.refreshInterval = setInterval(async () => {
+      const isValid = await this.sessionManager.validateSession()
+      
+      if (!isValid) {
+        this.handleSessionExpired()
+      }
+    }, 5 * 60 * 1000) // 5 minutes
+  }
+
+  handleSessionExpired() {
+    if (!this.warningShown) {
+      this.warningShown = true
+      console.warn('Session expired - user will need to log in again')
+      
+      // Show warning to user (optional)
+      this.showSessionExpiredWarning()
+    }
+    
+    // Clear expired session
+    this.sessionManager.clearSessionToken()
+    this.authContext.logout()
+    
+    // Stop refresh attempts
+    if (this.refreshInterval) {
+      clearInterval(this.refreshInterval)
+      this.refreshInterval = null
+    }
+  }
+
+  showSessionExpiredWarning() {
+    // Implement user notification
+    if (typeof window !== 'undefined') {
+      const warning = document.createElement('div')
+      warning.className = 'session-expired-warning'
+      warning.textContent = 'Your session has expired. Please log in again.'
+      warning.style.cssText = `
+        position: fixed;
+        top: 20px;
+        right: 20px;
+        background: #f59e0b;
+        color: white;
+        padding: 12px 16px;
+        border-radius: 6px;
+        z-index: 1000;
+        box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+      `
+      
+      document.body.appendChild(warning)
+      
+      setTimeout(() => {
+        if (warning.parentNode) {
+          warning.parentNode.removeChild(warning)
+        }
+      }, 5000)
+    }
+  }
+
+  stop() {
+    if (this.refreshInterval) {
+      clearInterval(this.refreshInterval)
+      this.refreshInterval = null
+    }
+  }
+}
+```
 
 ## Common API Issues
 
@@ -43,33 +314,58 @@ INSERT INTO cors (
 );
 ```
 
-### 2. 401 Unauthorized Errors
+### 2. 401 Unauthorized Errors (Session-Based)
 
-**Problem**: API requests return 401 status with "Invalid JWT" error
+**Problem**: API requests return 401 status with session-related errors
 
 **Common Causes**:
-- Missing or invalid API key
+- Missing or invalid session token
 - Expired session token
-- Incorrect service role key usage
+- Session token format validation failure
 
-**Solutions**:
+**Debugging Steps**:
 ```typescript
-// Check environment variables
-console.log('Supabase URL:', process.env.NEXT_PUBLIC_SUPABASE_URL)
-console.log('Supabase Anon Key:', process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY?.substring(0, 10) + '...')
-
-// Verify client initialization
-import { createClient } from '@supabase/supabase-js'
-
-const supabase = createClient(
-  process.env.NEXT_PUBLIC_SUPABASE_URL!,
-  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
-)
-
-// Test connection
-const { data, error } = await supabase.from('users').select('count')
-if (error) {
-  console.error('Supabase connection error:', error)
+// Check session authentication status
+async function debugSessionAuth() {
+  const sessionToken = localStorage.getItem('commentum_session_token')
+  
+  console.log('=== Session Auth Debug ===')
+  console.log('Session Token exists:', !!sessionToken)
+  
+  if (!sessionToken) {
+    console.error('No session token found - user needs to login')
+    return false
+  }
+  
+  console.log('Session Token length:', sessionToken.length)
+  console.log('Session Token format valid:', /^[a-f0-9]{64}$/.test(sessionToken))
+  
+  // Test API call with session token
+  try {
+    const response = await fetch('/functions/v1/comments', {
+      headers: {
+        'Authorization': `Bearer ${sessionToken}`,
+        'Content-Type': 'application/json'
+      }
+    })
+    
+    console.log('API Response Status:', response.status)
+    
+    if (response.status === 401) {
+      const error = await response.json()
+      console.error('Session authentication failed:', error)
+      
+      // Clear invalid session
+      localStorage.removeItem('commentum_session_token')
+      return false
+    }
+    
+    console.log('Session authentication successful')
+    return true
+  } catch (error) {
+    console.error('Session authentication error:', error)
+    return false
+  }
 }
 ```
 
@@ -78,34 +374,61 @@ if (error) {
 **Problem**: API requests return 403 with permission-related errors
 
 **Common Causes**:
-- User not authenticated
+- User not authenticated (no valid session)
+- User banned or muted
 - Insufficient permissions for action
 - Row Level Security (RLS) policy blocking access
 
 **Debugging Steps**:
 ```typescript
-// Check user authentication status
-const { data: { user } } = await supabase.auth.getUser()
-console.log('Current user:', user)
+// Check user authentication and permissions
+async function debugUserPermissions() {
+  const sessionToken = localStorage.getItem('commentum_session_token')
+  if (!sessionToken) {
+    console.error('No session token - cannot check permissions')
+    return
+  }
 
-// Check user role
-if (user) {
-  const { data: userData } = await supabase
-    .from('users')
-    .select('role, banned, shadow_banned')
-    .eq('id', user.id)
-    .single()
-  
-  console.log('User data:', userData)
+  try {
+    // Test basic API access
+    const commentsResponse = await fetch('/functions/v1/comments?media_id=1', {
+      headers: {
+        'Authorization': `Bearer ${sessionToken}`,
+        'Content-Type': 'application/json'
+      }
+    })
+    
+    console.log('Comments API Status:', commentsResponse.status)
+    
+    if (commentsResponse.status === 403) {
+      const error = await commentsResponse.json()
+      console.error('Comments API forbidden:', error)
+      
+      // Check if user is banned
+      if (error.error?.includes('banned') || error.error?.includes('muted')) {
+        console.error('User account restricted:', error.error)
+      }
+    }
+    
+    // Test voting permissions
+    const voteResponse = await fetch('/functions/v1/voting', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${sessionToken}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        action: 'upvote',
+        comment_id: 1
+      })
+    })
+    
+    console.log('Voting API Status:', voteResponse.status)
+    
+  } catch (error) {
+    console.error('Permission check error:', error)
+  }
 }
-
-// Test RLS policies
-const { data, error } = await supabase
-  .from('comments')
-  .select('*')
-  .limit(1)
-
-console.log('RLS test result:', { data, error })
 ```
 
 ### 4. Rate Limiting Issues
@@ -114,35 +437,77 @@ console.log('RLS test result:', { data, error })
 
 **Solutions**:
 ```typescript
-// Implement client-side rate limiting
-class RateLimiter {
+// Implement client-side rate limiting with session awareness
+class SessionRateLimiter {
   constructor(maxRequests = 30, windowMs = 3600000) {
     this.maxRequests = maxRequests
     this.windowMs = windowMs
-    this.requests = []
+    this.requests = new Map() // Track by session token
   }
 
-  canProceed() {
+  canProceed(sessionToken: string) {
+    if (!sessionToken) {
+      throw new Error('No session token provided')
+    }
+
     const now = Date.now()
-    this.requests = this.requests.filter(time => now - time < this.windowMs)
+    const windowStart = Math.floor(now / this.windowMs) * this.windowMs
     
-    if (this.requests.length >= this.maxRequests) {
-      const oldestRequest = Math.min(...this.requests)
+    if (!this.requests.has(sessionToken)) {
+      this.requests.set(sessionToken, [])
+    }
+    
+    const userRequests = this.requests.get(sessionToken)
+    
+    // Filter requests within current window
+    const validRequests = userRequests.filter(time => now - time < this.windowMs)
+    
+    if (validRequests.length >= this.maxRequests) {
+      const oldestRequest = Math.min(...validRequests)
       const resetTime = oldestRequest + this.windowMs
       throw new Error(`Rate limit exceeded. Reset at ${new Date(resetTime)}`)
     }
     
-    this.requests.push(now)
+    validRequests.push(now)
+    this.requests.set(sessionToken, validRequests)
     return true
+  }
+
+  // Clear expired requests for all sessions
+  cleanup() {
+    const now = Date.now()
+    for (const [sessionToken, requests] of this.requests.entries()) {
+      const validRequests = requests.filter(time => now - time < this.windowMs)
+      if (validRequests.length === 0) {
+        this.requests.delete(sessionToken)
+      } else {
+        this.requests.set(sessionToken, validRequests)
+      }
+    }
   }
 }
 
-const rateLimiter = new RateLimiter()
+const rateLimiter = new SessionRateLimiter()
 
-// Wrap API calls
-async function makeAPIRequest(url, options) {
-  rateLimiter.canProceed()
-  return fetch(url, options)
+// Wrap API calls with rate limiting
+async function makeAuthenticatedAPIRequest(url: string, options: RequestInit = {}) {
+  const sessionToken = localStorage.getItem('commentum_session_token')
+  
+  if (!sessionToken) {
+    throw new Error('No session token - please log in')
+  }
+  
+  // Check rate limit
+  rateLimiter.canProceed(sessionToken)
+  
+  // Add session token to headers
+  const headers = new Headers(options.headers || {})
+  headers.set('Authorization', `Bearer ${sessionToken}`)
+  
+  return fetch(url, {
+    ...options,
+    headers
+  })
 }
 ```
 

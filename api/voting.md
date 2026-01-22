@@ -1,11 +1,22 @@
-# Voting API
+# 🔒 Voting API - Session-Based Authentication
 
-The Voting API handles upvote/downvote functionality for comments with built-in abuse detection and rate limiting.
+The Voting API handles upvote/downvote functionality for comments with built-in abuse detection and rate limiting using secure session-based authentication.
+
+## 🔒 Security Overview
+
+**CRITICAL**: This API uses session-based authentication. The `user_id` parameter has been removed to prevent identity spoofing. User identity is extracted from the session token.
 
 ## Endpoint
 
 ```
-POST /voting
+POST /functions/v1/voting
+```
+
+## Request Headers
+
+```http
+Authorization: Bearer <session_token>
+Content-Type: application/json
 ```
 
 ## Request Body
@@ -13,7 +24,6 @@ POST /voting
 ```typescript
 interface VoteRequest {
   action: 'upvote' | 'downvote' | 'remove'
-  user_id: number
   comment_id: number
 }
 ```
@@ -23,20 +33,18 @@ interface VoteRequest {
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `action` | string | Yes | Voting action to perform |
-| `user_id` | number | Yes | ID of the user voting |
 | `comment_id` | number | Yes | ID of the comment being voted on |
 
 ## Actions
 
 ### 1. Upvote Comment
 
-**Required Parameters:** `action: 'upvote'`, `user_id`, `comment_id`
+**Required Parameters:** `action: 'upvote'`, `comment_id`
 
 #### Request
 ```json
 {
   "action": "upvote",
-  "user_id": 123,
   "comment_id": 1001
 }
 ```
@@ -56,13 +64,12 @@ interface VoteRequest {
 
 ### 2. Downvote Comment
 
-**Required Parameters:** `action: 'downvote'`, `user_id`, `comment_id`
+**Required Parameters:** `action: 'downvote'`, `comment_id`
 
 #### Request
 ```json
 {
   "action": "downvote",
-  "user_id": 123,
   "comment_id": 1001
 }
 ```
@@ -82,13 +89,12 @@ interface VoteRequest {
 
 ### 3. Remove Vote
 
-**Required Parameters:** `action: 'remove'`, `user_id`, `comment_id`
+**Required Parameters:** `action: 'remove'`, `comment_id`
 
 #### Request
 ```json
 {
   "action": "remove",
-  "user_id": 123,
   "comment_id": 1001
 }
 ```
@@ -109,7 +115,6 @@ If a user votes on a comment they've already voted on, the vote is updated:
 ```json
 {
   "action": "downvote",
-  "user_id": 123,
   "comment_id": 1001
 }
 ```
@@ -129,6 +134,20 @@ If a user votes on a comment they've already voted on, the vote is updated:
 
 ## Error Responses
 
+### 401 Unauthorized
+```json
+{
+  "error": "Missing session token"
+}
+```
+
+### 401 Unauthorized (Session Expired)
+```json
+{
+  "error": "Invalid or expired session token"
+}
+```
+
 ### 403 Forbidden
 ```json
 {
@@ -143,12 +162,6 @@ If a user votes on a comment they've already voted on, the vote is updated:
 ```
 
 ### 404 Not Found
-```json
-{
-  "error": "User not found"
-}
-```
-
 ```json
 {
   "error": "Comment not found"
@@ -168,6 +181,48 @@ If a user votes on a comment they've already voted on, the vote is updated:
   "error": "Internal server error"
 }
 ```
+
+## 🔐 Authentication
+
+### Session-Based Authentication
+
+All requests must include a valid session token:
+
+```javascript
+// ❌ OLD (Vulnerable)
+const response = await fetch('/functions/v1/voting', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({
+    action: 'upvote',
+    user_id: 123,  // Could be faked!
+    comment_id: 1001
+  })
+})
+
+// ✅ NEW (Secure)
+const sessionToken = localStorage.getItem('commentum_session_token')
+const response = await fetch('/functions/v1/voting', {
+  method: 'POST',
+  headers: {
+    'Authorization': `Bearer ${sessionToken}`,
+    'Content-Type': 'application/json'
+  },
+  body: JSON.stringify({
+    action: 'upvote',
+    comment_id: 1001  // No user_id needed!
+  })
+})
+```
+
+### Session Validation
+
+The API automatically:
+1. Extracts session token from Authorization header
+2. Validates session against database
+3. Checks user status (banned/muted)
+4. Updates last used time
+5. Extracts user ID from session
 
 ## Voting Rules
 
@@ -195,20 +250,18 @@ The system automatically tracks and prevents:
 
 ## Usage Examples
 
-### React Voting Component
+### React Voting Component with Session Management
 
 ```typescript
 import { useState, useEffect } from 'react';
 
 interface VotingComponentProps {
   commentId: number;
-  userId: number;
   initialVotes?: { upvotes: number; downvotes: number; userVote: number };
 }
 
 export const VotingComponent: React.FC<VotingComponentProps> = ({
   commentId,
-  userId,
   initialVotes = { upvotes: 0, downvotes: 0, userVote: 0 }
 }) => {
   const [votes, setVotes] = useState(initialVotes);
@@ -220,12 +273,19 @@ export const VotingComponent: React.FC<VotingComponentProps> = ({
     setError(null);
 
     try {
-      const response = await fetch('/voting', {
+      const sessionToken = localStorage.getItem('commentum_session_token');
+      if (!sessionToken) {
+        throw new Error('Not authenticated');
+      }
+
+      const response = await fetch('/functions/v1/voting', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Authorization': `Bearer ${sessionToken}`,
+          'Content-Type': 'application/json'
+        },
         body: JSON.stringify({
           action,
-          user_id: userId,
           comment_id: commentId
         })
       });
@@ -287,7 +347,7 @@ export const VotingComponent: React.FC<VotingComponentProps> = ({
 };
 ```
 
-### Vote Management Hook
+### Vote Management Hook with Session Auth
 
 ```typescript
 import { useState, useCallback } from 'react';
@@ -303,7 +363,6 @@ interface UseVotingResult {
 
 export const useVoting = (
   commentId: number,
-  userId: number,
   initialVotes: { upvotes: number; downvotes: number; userVote: number }
 ): UseVotingResult => {
   const [votes, setVotes] = useState(initialVotes);
@@ -315,12 +374,19 @@ export const useVoting = (
     setError(null);
 
     try {
-      const response = await fetch('/voting', {
+      const sessionToken = localStorage.getItem('commentum_session_token');
+      if (!sessionToken) {
+        throw new Error('Not authenticated');
+      }
+
+      const response = await fetch('/functions/v1/voting', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Authorization': `Bearer ${sessionToken}`,
+          'Content-Type': 'application/json'
+        },
         body: JSON.stringify({
           action,
-          user_id: userId,
           comment_id: commentId
         })
       });
@@ -366,7 +432,7 @@ export const useVoting = (
     } finally {
       setLoading(false);
     }
-  }, [commentId, userId]);
+  }, [commentId]);
 
   return {
     upvote: () => vote('upvote'),
@@ -377,6 +443,71 @@ export const useVoting = (
     error
   };
 };
+```
+
+### Vanilla JavaScript API Client with Session Auth
+
+```javascript
+class CommentumAPI {
+  constructor(sessionToken) {
+    this.sessionToken = sessionToken
+  }
+
+  async vote(commentId, action) {
+    return this.makeRequest('/functions/v1/voting', {
+      method: 'POST',
+      body: JSON.stringify({
+        action,
+        comment_id: commentId
+      })
+    })
+  }
+
+  async upvote(commentId) {
+    return this.vote(commentId, 'upvote')
+  }
+
+  async downvote(commentId) {
+    return this.vote(commentId, 'downvote')
+  }
+
+  async removeVote(commentId) {
+    return this.vote(commentId, 'remove')
+  }
+
+  async makeRequest(endpoint, options = {}) {
+    if (!this.sessionToken) {
+      throw new Error('Not authenticated')
+    }
+
+    const response = await fetch(endpoint, {
+      ...options,
+      headers: {
+        'Authorization': `Bearer ${this.sessionToken}`,
+        'Content-Type': 'application/json',
+        ...options.headers
+      }
+    })
+
+    if (response.status === 401) {
+      localStorage.removeItem('commentum_session_token')
+      throw new Error('Session expired. Please log in again.')
+    }
+
+    return response.json()
+  }
+}
+
+// Usage
+const api = new CommentumAPI(localStorage.getItem('commentum_session_token'))
+
+// Vote on a comment
+try {
+  const result = await api.upvote(1001)
+  console.log('Vote successful:', result)
+} catch (error) {
+  console.error('Voting error:', error.message)
+}
 ```
 
 ### Batch Vote Loading
@@ -419,12 +550,42 @@ const CommentList = ({ comments, userId }) => {
 };
 ```
 
-## Security Considerations
+## 🔒 Security Considerations
 
+- **Session Authentication**: All requests require valid session tokens
+- **Zero-Trust Architecture**: No client-provided user data is trusted
 - **Self-Vote Prevention**: Users cannot vote on their own comments
 - **Abuse Tracking**: Suspicious voting patterns are logged and tracked
 - **Rate Limiting**: Prevents vote spamming and manipulation
 - **Audit Trail**: All voting actions are logged for moderation review
+
+## 🚨 Breaking Changes from Previous Version
+
+### Before (Vulnerable)
+```javascript
+// ❌ Client could send any user_id
+fetch('/functions/v1/voting', {
+  body: JSON.stringify({
+    action: 'upvote',
+    user_id: 123,  // Could be faked!
+    comment_id: 1001
+  })
+})
+```
+
+### After (Secure)
+```javascript
+// ✅ User ID extracted from session
+fetch('/functions/v1/voting', {
+  headers: { 'Authorization': `Bearer ${sessionToken}` },
+  body: JSON.stringify({
+    action: 'upvote',
+    comment_id: 1001  // No user_id needed!
+  })
+})
+```
+
+This secure API ensures that voting operations can only be performed by authenticated users while maintaining robust abuse detection and prevention mechanisms.
 
 ## Performance Considerations
 

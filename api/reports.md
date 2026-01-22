@@ -1,11 +1,22 @@
-# Reports API
+# 🔒 Reports API - Session-Based Authentication
 
-The Reports API handles comment reporting and moderation workflow management.
+The Reports API handles comment reporting and moderation workflow management using secure session-based authentication.
+
+## 🔒 Security Overview
+
+**CRITICAL**: This API uses session-based authentication. The `user_id` parameter has been removed to prevent identity spoofing. User identity is extracted from the session token.
 
 ## Endpoint
 
 ```
-POST /reports
+POST /functions/v1/reports
+```
+
+## Request Headers
+
+```http
+Authorization: Bearer <session_token>
+Content-Type: application/json
 ```
 
 ## Request Body
@@ -13,7 +24,6 @@ POST /reports
 ```typescript
 interface ReportRequest {
   action: 'create' | 'resolve' | 'dismiss' | 'escalate'
-  user_id: number
   comment_id?: number
   report_id?: number
   reason?: 'spam' | 'offensive' | 'harassment' | 'spoiler' | 'nsfw' | 'off_topic' | 'other'
@@ -27,7 +37,6 @@ interface ReportRequest {
 | Parameter | Type | Required | Actions | Description |
 |-----------|------|----------|---------|-------------|
 | `action` | string | Yes | All | The action to perform |
-| `user_id` | number | Yes | All | ID of the user performing the action |
 | `comment_id` | number | create | Create | ID of the comment being reported |
 | `report_id` | number | resolve/dismiss/escalate | Moderation | ID of the report being acted upon |
 | `reason` | string | create | Create | Reason for the report |
@@ -38,13 +47,12 @@ interface ReportRequest {
 
 ### 1. Create Report
 
-**Required Parameters:** `action: 'create'`, `user_id`, `comment_id`, `reason`
+**Required Parameters:** `action: 'create'`, `comment_id`, `reason`
 
 #### Request
 ```json
 {
   "action": "create",
-  "user_id": 123,
   "comment_id": 1001,
   "reason": "offensive",
   "notes": "This comment contains inappropriate language"
@@ -66,7 +74,7 @@ interface ReportRequest {
 
 ### 2. Resolve Report
 
-**Required Parameters:** `action: 'resolve'`, `user_id`, `report_id`
+**Required Parameters:** `action: 'resolve'`, `report_id`
 
 **Permissions:** Moderator, Admin, Super Admin
 
@@ -74,7 +82,6 @@ interface ReportRequest {
 ```json
 {
   "action": "resolve",
-  "user_id": 456,
   "report_id": 3001,
   "notes": "Removed offensive content, warned user"
 }
@@ -93,7 +100,7 @@ interface ReportRequest {
 
 ### 3. Dismiss Report
 
-**Required Parameters:** `action: 'dismiss'`, `user_id`, `report_id`
+**Required Parameters:** `action: 'dismiss'`, `report_id`
 
 **Permissions:** Moderator, Admin, Super Admin
 
@@ -101,7 +108,6 @@ interface ReportRequest {
 ```json
 {
   "action": "dismiss",
-  "user_id": 456,
   "report_id": 3001,
   "notes": "No violation found, comment is appropriate"
 }
@@ -120,7 +126,7 @@ interface ReportRequest {
 
 ### 4. Escalate Report
 
-**Required Parameters:** `action: 'escalate'`, `user_id`, `report_id`, `escalate_to`
+**Required Parameters:** `action: 'escalate'`, `report_id`, `escalate_to`
 
 **Permissions:** Moderator, Admin, Super Admin
 
@@ -128,7 +134,6 @@ interface ReportRequest {
 ```json
 {
   "action": "escalate",
-  "user_id": 456,
   "report_id": 3001,
   "escalate_to": 789,
   "notes": "Requires admin review due to severity"
@@ -159,6 +164,20 @@ interface ReportRequest {
 | `other` | Other violations (specify in notes) | 1 |
 
 ## Error Responses
+
+### 401 Unauthorized
+```json
+{
+  "error": "Missing session token"
+}
+```
+
+### 401 Unauthorized (Session Expired)
+```json
+{
+  "error": "Invalid or expired session token"
+}
+```
 
 ### 400 Bad Request
 ```json
@@ -194,6 +213,58 @@ interface ReportRequest {
 }
 ```
 
+### 500 Internal Server Error
+```json
+{
+  "error": "Internal server error"
+}
+```
+
+## 🔐 Authentication
+
+### Session-Based Authentication
+
+All requests must include a valid session token:
+
+```javascript
+// ❌ OLD (Vulnerable)
+const response = await fetch('/functions/v1/reports', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({
+    action: 'create',
+    user_id: 123,  // Could be faked!
+    comment_id: 1001,
+    reason: 'offensive'
+  })
+})
+
+// ✅ NEW (Secure)
+const sessionToken = localStorage.getItem('commentum_session_token')
+const response = await fetch('/functions/v1/reports', {
+  method: 'POST',
+  headers: {
+    'Authorization': `Bearer ${sessionToken}`,
+    'Content-Type': 'application/json'
+  },
+  body: JSON.stringify({
+    action: 'create',
+    comment_id: 1001,
+    reason: 'offensive'  // No user_id needed!
+  })
+})
+```
+
+### Session Validation
+
+The API automatically:
+1. Extracts session token from Authorization header
+2. Validates session against database
+3. Checks user status (banned/muted)
+4. Updates last used time
+5. Extracts user ID from session
+6. Validates user permissions for moderation actions
+
 ## Validation Rules
 
 ### Report Creation
@@ -209,20 +280,18 @@ interface ReportRequest {
 
 ## Usage Examples
 
-### Report Comment Component
+### Report Comment Component with Session Auth
 
 ```typescript
 import { useState } from 'react';
 
 interface ReportButtonProps {
   commentId: number;
-  userId: number;
   onReported: (report: any) => void;
 }
 
 export const ReportButton: React.FC<ReportButtonProps> = ({
   commentId,
-  userId,
   onReported
 }) => {
   const [showForm, setShowForm] = useState(false);
@@ -234,12 +303,19 @@ export const ReportButton: React.FC<ReportButtonProps> = ({
     setError(null);
 
     try {
-      const response = await fetch('/reports', {
+      const sessionToken = localStorage.getItem('commentum_session_token');
+      if (!sessionToken) {
+        throw new Error('Not authenticated');
+      }
+
+      const response = await fetch('/functions/v1/reports', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Authorization': `Bearer ${sessionToken}`,
+          'Content-Type': 'application/json'
+        },
         body: JSON.stringify({
           action: 'create',
-          user_id: userId,
           comment_id: commentId,
           reason,
           notes
@@ -344,18 +420,16 @@ const ReportForm: React.FC<ReportFormProps> = ({
 };
 ```
 
-### Moderation Queue Component
+### Moderation Queue Component with Session Auth
 
 ```typescript
 import { useState, useEffect } from 'react';
 
 interface ModerationQueueProps {
-  userId: number;
   userRole: string;
 }
 
 export const ModerationQueue: React.FC<ModerationQueueProps> = ({
-  userId,
   userRole
 }) => {
   const [reports, setReports] = useState([]);
@@ -368,7 +442,17 @@ export const ModerationQueue: React.FC<ModerationQueueProps> = ({
 
   const loadModerationQueue = async () => {
     try {
-      const response = await fetch('/moderation-queue');
+      const sessionToken = localStorage.getItem('commentum_session_token');
+      if (!sessionToken) {
+        throw new Error('Not authenticated');
+      }
+
+      const response = await fetch('/moderation-queue', {
+        headers: {
+          'Authorization': `Bearer ${sessionToken}`,
+          'Content-Type': 'application/json'
+        }
+      });
       const data = await response.json();
       
       if (!response.ok) {
@@ -385,12 +469,19 @@ export const ModerationQueue: React.FC<ModerationQueueProps> = ({
 
   const handleAction = async (reportId: number, action: string, notes?: string) => {
     try {
-      const response = await fetch('/reports', {
+      const sessionToken = localStorage.getItem('commentum_session_token');
+      if (!sessionToken) {
+        throw new Error('Not authenticated');
+      }
+
+      const response = await fetch('/functions/v1/reports', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Authorization': `Bearer ${sessionToken}`,
+          'Content-Type': 'application/json'
+        },
         body: JSON.stringify({
           action,
-          user_id: userId,
           report_id: reportId,
           notes
         })
@@ -509,18 +600,131 @@ const ReportCard: React.FC<ReportCardProps> = ({
 };
 ```
 
+### Vanilla JavaScript API Client with Session Auth
+
+```javascript
+class CommentumAPI {
+  constructor(sessionToken) {
+    this.sessionToken = sessionToken
+  }
+
+  async createReport(commentId, reason, notes) {
+    return this.makeRequest('/functions/v1/reports', {
+      method: 'POST',
+      body: JSON.stringify({
+        action: 'create',
+        comment_id: commentId,
+        reason,
+        notes
+      })
+    })
+  }
+
+  async resolveReport(reportId, notes) {
+    return this.makeRequest('/functions/v1/reports', {
+      method: 'POST',
+      body: JSON.stringify({
+        action: 'resolve',
+        report_id: reportId,
+        notes
+      })
+    })
+  }
+
+  async dismissReport(reportId, notes) {
+    return this.makeRequest('/functions/v1/reports', {
+      method: 'POST',
+      body: JSON.stringify({
+        action: 'dismiss',
+        report_id: reportId,
+        notes
+      })
+    })
+  }
+
+  async makeRequest(endpoint, options = {}) {
+    if (!this.sessionToken) {
+      throw new Error('Not authenticated')
+    }
+
+    const response = await fetch(endpoint, {
+      ...options,
+      headers: {
+        'Authorization': `Bearer ${this.sessionToken}`,
+        'Content-Type': 'application/json',
+        ...options.headers
+      }
+    })
+
+    if (response.status === 401) {
+      localStorage.removeItem('commentum_session_token')
+      throw new Error('Session expired. Please log in again.')
+    }
+
+    return response.json()
+  }
+}
+
+// Usage
+const api = new CommentumAPI(localStorage.getItem('commentum_session_token'))
+
+// Report a comment
+try {
+  const report = await api.createReport(
+    1001,
+    'offensive',
+    'This comment contains inappropriate language'
+  )
+  console.log('Report created:', report)
+} catch (error) {
+  console.error('Reporting error:', error.message)
+}
+```
+
 ## Rate Limiting
 
 - **Report Creation**: 10 per hour per user (configurable)
 - **Moderation Actions**: No rate limits for authorized moderators
 - **Escalation**: No rate limits to prevent moderation bottlenecks
 
-## Security Considerations
+## 🔒 Security Considerations
 
+- **Session Authentication**: All requests require valid session tokens
+- **Zero-Trust Architecture**: No client-provided user data is trusted
 - **Permission Validation**: All actions are validated against user roles
 - **Audit Trail**: All report actions are logged for accountability
 - **Duplicate Prevention**: Users cannot report the same comment multiple times
 - **Rate Limiting**: Prevents report spam and abuse
+
+## 🚨 Breaking Changes from Previous Version
+
+### Before (Vulnerable)
+```javascript
+// ❌ Client could send any user_id
+fetch('/functions/v1/reports', {
+  body: JSON.stringify({
+    action: 'create',
+    user_id: 123,  // Could be faked!
+    comment_id: 1001,
+    reason: 'offensive'
+  })
+})
+```
+
+### After (Secure)
+```javascript
+// ✅ User ID extracted from session
+fetch('/functions/v1/reports', {
+  headers: { 'Authorization': `Bearer ${sessionToken}` },
+  body: JSON.stringify({
+    action: 'create',
+    comment_id: 1001,
+    reason: 'offensive'  // No user_id needed!
+  })
+})
+```
+
+This secure API ensures that reporting and moderation operations can only be performed by authenticated users with appropriate permissions while maintaining a complete audit trail.
 
 ## Workflow Integration
 

@@ -1,15 +1,19 @@
-# React Integration Example
+# 🔒 React Integration Example - Session-Based Authentication
 
-This example demonstrates how to integrate Commentum into a React application using TypeScript and modern React patterns.
+This example demonstrates how to integrate Commentum into a React application using TypeScript and modern React patterns with **secure session-based authentication**.
+
+## 🚨 Security Notice
+
+This example uses **session-based authentication** to prevent identity spoofing attacks. The `user_id` is never passed from the client - it's extracted from the session token on the server.
 
 ## Project Setup
 
 ### 1. Install Dependencies
 
 ```bash
-npm install @supabase/supabase-js @tanstack/react-query zustand react-hook-form @hookform/resolvers zod
+npm install @supabase/supabase-js @tanstack/react-query zustand react-hook-form @hookform/resolvers zod date-fns
 # or
-yarn add @supabase/supabase-js @tanstack/react-query zustand react-hook-form @hookform/resolvers zod
+yarn add @supabase/supabase-js @tanstack/react-query zustand react-hook-form @hookform/resolvers zod date-fns
 ```
 
 ### 2. Environment Configuration
@@ -21,31 +25,59 @@ NEXT_PUBLIC_SUPABASE_ANON_KEY=your_supabase_anon_key
 NEXT_PUBLIC_COMMENTUM_API_URL=https://your-project.supabase.co/functions/v1
 ```
 
-### 3. Supabase Client Configuration
+### 3. Secure API Client with Session Management
 
 ```typescript
-// lib/supabase.ts
-import { createClient } from '@supabase/supabase-js'
+// lib/commentum-client.ts
+export class CommentumClient {
+  private baseURL: string
+  private sessionToken: string | null = null
 
-const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL!
-const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
+  constructor(baseURL: string) {
+    this.baseURL = baseURL
+    this.loadSessionToken()
+  }
 
-export const supabase = createClient(supabaseUrl, supabaseAnonKey)
+  private loadSessionToken() {
+    if (typeof window !== 'undefined') {
+      this.sessionToken = localStorage.getItem('commentum_session_token')
+    }
+  }
 
-// Commentum API client
-export const commentumAPI = {
-  baseURL: process.env.NEXT_PUBLIC_COMMENTUM_API_URL!,
-  
-  async request<T>(endpoint: string, options: RequestInit = {}): Promise<T> {
+  setSessionToken(token: string) {
+    this.sessionToken = token
+    if (typeof window !== 'undefined') {
+      localStorage.setItem('commentum_session_token', token)
+    }
+  }
+
+  clearSessionToken() {
+    this.sessionToken = null
+    if (typeof window !== 'undefined') {
+      localStorage.removeItem('commentum_session_token')
+    }
+  }
+
+  private async request<T>(endpoint: string, options: RequestInit = {}): Promise<T> {
+    if (!this.sessionToken) {
+      throw new Error('Not authenticated - Please log in first')
+    }
+
     const url = `${this.baseURL}${endpoint}`
     
     const response = await fetch(url, {
       headers: {
         'Content-Type': 'application/json',
+        'Authorization': `Bearer ${this.sessionToken}`,
         ...options.headers,
       },
       ...options,
     })
+    
+    if (response.status === 401) {
+      this.clearSessionToken()
+      throw new Error('Session expired - Please log in again')
+    }
     
     if (!response.ok) {
       const error = await response.json()
@@ -54,6 +86,274 @@ export const commentumAPI = {
     
     return response.json()
   }
+
+  // Identity Resolution
+  async resolveIdentity(clientType: string, token: string) {
+    const response = await fetch(`${this.baseURL}/identity-resolve`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY}`,
+      },
+      body: JSON.stringify({
+        client_type: clientType,
+        token: token,
+      }),
+    })
+
+    if (!response.ok) {
+      const error = await response.json()
+      throw new Error(error.error || 'Identity resolution failed')
+    }
+
+    const data = await response.json()
+    this.setSessionToken(data.session_token)
+    return data
+  }
+
+  // Comments API
+  async getComments(mediaId: number) {
+    return this.request(`/comments?media_id=${mediaId}`)
+  }
+
+  async createComment(data: {
+    media_id?: number
+    media_info?: {
+      external_id: string
+      media_type: 'anime' | 'manga' | 'movie' | 'tv' | 'other'
+      title: string
+      year?: number
+      poster_url?: string
+    }
+    content: string
+    parent_id?: number
+  }) {
+    return this.request('/comments', {
+      method: 'POST',
+      body: JSON.stringify({
+        action: 'create',
+        ...data,
+      }),
+    })
+  }
+
+  async editComment(commentId: number, content: string) {
+    return this.request('/comments', {
+      method: 'POST',
+      body: JSON.stringify({
+        action: 'edit',
+        comment_id: commentId,
+        content,
+      }),
+    })
+  }
+
+  async deleteComment(commentId: number) {
+    return this.request('/comments', {
+      method: 'POST',
+      body: JSON.stringify({
+        action: 'delete',
+        comment_id: commentId,
+      }),
+    })
+  }
+
+  // Voting API
+  async vote(commentId: number, action: 'upvote' | 'downvote' | 'remove') {
+    return this.request('/voting', {
+      method: 'POST',
+      body: JSON.stringify({
+        action,
+        comment_id: commentId,
+      }),
+    })
+  }
+
+  // Reports API
+  async createReport(commentId: number, reason: string, notes?: string) {
+    return this.request('/reports', {
+      method: 'POST',
+      body: JSON.stringify({
+        action: 'create',
+        comment_id: commentId,
+        reason,
+        notes,
+      }),
+    })
+  }
+}
+
+export const commentumClient = new CommentumClient(
+  process.env.NEXT_PUBLIC_COMMENTUM_API_URL!
+)
+```
+
+## Authentication Context
+
+### 1. Authentication Provider
+
+```typescript
+// contexts/AuthProvider.tsx
+import React, { createContext, useContext, ReactNode, useState, useEffect } from 'react'
+import { commentumClient } from '../lib/commentum-client'
+
+interface User {
+  id: number
+  username: string
+  avatar_url?: string
+  client_type: 'anilist' | 'mal' | 'simkl'
+}
+
+interface AuthContextType {
+  user: User | null
+  sessionToken: string | null
+  isAuthenticated: boolean
+  login: (clientType: string, token: string) => Promise<void>
+  logout: () => void
+  loading: boolean
+}
+
+const AuthContext = createContext<AuthContextType | null>(null)
+
+export const useAuth = () => {
+  const context = useContext(AuthContext)
+  if (!context) {
+    throw new Error('useAuth must be used within AuthProvider')
+  }
+  return context
+}
+
+interface AuthProviderProps {
+  children: ReactNode
+}
+
+export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
+  const [user, setUser] = useState<User | null>(null)
+  const [sessionToken, setSessionToken] = useState<string | null>(null)
+  const [loading, setLoading] = useState(true)
+
+  useEffect(() => {
+    // Check for existing session on mount
+    const token = localStorage.getItem('commentum_session_token')
+    if (token) {
+      setSessionToken(token)
+      commentumClient.setSessionToken(token)
+      // You might want to validate the token here
+    }
+    setLoading(false)
+  }, [])
+
+  const login = async (clientType: string, token: string) => {
+    setLoading(true)
+    try {
+      const data = await commentumClient.resolveIdentity(clientType, token)
+      setUser(data.user)
+      setSessionToken(data.session_token)
+    } catch (error) {
+      throw error
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const logout = () => {
+    setUser(null)
+    setSessionToken(null)
+    commentumClient.clearSessionToken()
+  }
+
+  const value: AuthContextType = {
+    user,
+    sessionToken,
+    isAuthenticated: !!user,
+    login,
+    logout,
+    loading,
+  }
+
+  return (
+    <AuthContext.Provider value={value}>
+      {children}
+    </AuthContext.Provider>
+  )
+}
+```
+
+### 2. Login Component
+
+```typescript
+// components/LoginForm.tsx
+import React, { useState } from 'react'
+import { useAuth } from '../contexts/AuthProvider'
+
+interface LoginFormProps {
+  onSuccess?: () => void
+}
+
+export const LoginForm: React.FC<LoginFormProps> = ({ onSuccess }) => {
+  const { login } = useAuth()
+  const [clientType, setClientType] = useState<'anilist' | 'mal' | 'simkl'>('anilist')
+  const [token, setToken] = useState('')
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault()
+    if (!token.trim()) return
+
+    setLoading(true)
+    setError(null)
+
+    try {
+      await login(clientType, token.trim())
+      onSuccess?.()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Login failed')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  return (
+    <div className="login-form">
+      <h3>Login to Comment</h3>
+      <form onSubmit={handleSubmit}>
+        <div className="form-group">
+          <label>Service:</label>
+          <select
+            value={clientType}
+            onChange={(e) => setClientType(e.target.value as any)}
+            disabled={loading}
+          >
+            <option value="anilist">AniList</option>
+            <option value="mal">MyAnimeList</option>
+            <option value="simkl">SIMKL</option>
+          </select>
+        </div>
+
+        <div className="form-group">
+          <label>Access Token:</label>
+          <input
+            type="password"
+            value={token}
+            onChange={(e) => setToken(e.target.value)}
+            placeholder="Enter your access token"
+            disabled={loading}
+            required
+          />
+          <small>
+            Get your token from your service's developer settings
+          </small>
+        </div>
+
+        {error && <div className="error">{error}</div>}
+
+        <button type="submit" disabled={loading || !token.trim()}>
+          {loading ? 'Logging in...' : 'Login'}
+        </button>
+      </form>
+    </div>
+  )
 }
 ```
 
@@ -70,7 +370,6 @@ import { CommentSystem } from './CommentSystem'
 interface CommentSystemContextType {
   mediaId: number
   mediaType: 'anime' | 'manga' | 'movie' | 'tv'
-  userId?: number
 }
 
 const CommentSystemContext = createContext<CommentSystemContextType | null>(null)
@@ -87,7 +386,6 @@ interface CommentSystemProviderProps {
   children: ReactNode
   mediaId: number
   mediaType: 'anime' | 'manga' | 'movie' | 'tv'
-  userId?: number
 }
 
 const queryClient = new QueryClient({
@@ -103,12 +401,10 @@ export const CommentSystemProvider: React.FC<CommentSystemProviderProps> = ({
   children,
   mediaId,
   mediaType,
-  userId,
 }) => {
   const contextValue: CommentSystemContextType = {
     mediaId,
     mediaType,
-    userId,
   }
 
   return (
@@ -130,10 +426,12 @@ import { useComments } from '../hooks/useComments'
 import { CommentForm } from './CommentForm'
 import { CommentList } from './CommentList'
 import { CommentSort } from './CommentSort'
+import { useAuth } from '../contexts/AuthProvider'
 import { useCommentSystem } from '../contexts/CommentSystemProvider'
 
 export const CommentSystem: React.FC = () => {
-  const { mediaId, userId } = useCommentSystem()
+  const { mediaId } = useCommentSystem()
+  const { isAuthenticated } = useAuth()
   const { 
     data: comments, 
     isLoading, 
@@ -169,9 +467,13 @@ export const CommentSystem: React.FC = () => {
         <CommentSort />
       </div>
 
-      {userId && (
+      {isAuthenticated ? (
         <div className="comment-form-section">
           <CommentForm onSuccess={refetch} />
+        </div>
+      ) : (
+        <div className="login-prompt">
+          <p>Please log in to comment</p>
         </div>
       )}
 
@@ -183,7 +485,7 @@ export const CommentSystem: React.FC = () => {
 }
 ```
 
-### 3. Comment Form Component
+### 3. Secure Comment Form Component
 
 ```typescript
 // components/CommentForm.tsx
@@ -215,7 +517,7 @@ export const CommentForm: React.FC<CommentFormProps> = ({
   onSuccess,
   onCancel,
 }) => {
-  const { mediaId, userId } = useCommentSystem()
+  const { mediaId } = useCommentSystem()
   const { success, error } = useToast()
   const createComment = useCreateComment()
 
@@ -232,14 +534,12 @@ export const CommentForm: React.FC<CommentFormProps> = ({
   const content = watch('content', '')
 
   const onSubmit = async (data: CommentFormData) => {
-    if (!userId) return
-
     try {
       await createComment.mutateAsync({
-        user_id: userId,
         media_id: mediaId,
         content: data.content.trim(),
         parent_id: parentId,
+        // No user_id needed - extracted from session!
       })
 
       reset()
@@ -301,258 +601,20 @@ export const CommentForm: React.FC<CommentFormProps> = ({
 }
 ```
 
-### 4. Comment List Component
+## Secure Hooks
 
-```typescript
-// components/CommentList.tsx
-import React, { useState } from 'react'
-import { CommentItem } from './CommentItem'
-import { Comment } from '../types/comment'
-
-interface CommentListProps {
-  comments: Comment[]
-  onUpdate?: () => void
-}
-
-export const CommentList: React.FC<CommentListProps> = ({
-  comments,
-  onUpdate,
-}) => {
-  const [expandedReplies, setExpandedReplies] = useState<Set<number>>(new Set())
-
-  const toggleReplies = (commentId: number) => {
-    setExpandedReplies(prev => {
-      const newSet = new Set(prev)
-      if (newSet.has(commentId)) {
-        newSet.delete(commentId)
-      } else {
-        newSet.add(commentId)
-      }
-      return newSet
-    })
-  }
-
-  // Organize comments into threads
-  const topLevelComments = comments.filter(comment => !comment.parent_id)
-  const repliesByParent = comments.reduce((acc, comment) => {
-    if (comment.parent_id) {
-      if (!acc[comment.parent_id]) {
-        acc[comment.parent_id] = []
-      }
-      acc[comment.parent_id].push(comment)
-    }
-    return acc
-  }, {} as Record<number, Comment[]>)
-
-  return (
-    <div className="comment-list">
-      {topLevelComments.length === 0 ? (
-        <div className="no-comments">
-          <p>No comments yet. Be the first to share your thoughts!</p>
-        </div>
-      ) : (
-        <div className="comments-tree">
-          {topLevelComments.map(comment => (
-            <CommentItem
-              key={comment.id}
-              comment={comment}
-              replies={repliesByParent[comment.id] || []}
-              isExpanded={expandedReplies.has(comment.id)}
-              onToggleReplies={() => toggleReplies(comment.id)}
-              onUpdate={onUpdate}
-            />
-          ))}
-        </div>
-      )}
-    </div>
-  )
-}
-```
-
-### 5. Individual Comment Item
-
-```typescript
-// components/CommentItem.tsx
-import React, { useState } from 'react'
-import { Comment } from '../types/comment'
-import { VotingButtons } from './VotingButtons'
-import { CommentActions } from './CommentActions'
-import { CommentForm } from './CommentForm'
-import { useAuth } from '../contexts/AuthContext'
-import { formatDistanceToNow } from 'date-fns'
-
-interface CommentItemProps {
-  comment: Comment
-  replies?: Comment[]
-  isExpanded?: boolean
-  onToggleReplies?: () => void
-  onUpdate?: () => void
-  level?: number
-}
-
-export const CommentItem: React.FC<CommentItemProps> = ({
-  comment,
-  replies = [],
-  isExpanded = false,
-  onToggleReplies,
-  onUpdate,
-  level = 0,
-}) => {
-  const { user } = useAuth()
-  const [isReplying, setIsReplying] = useState(false)
-  const [isEditing, setIsEditing] = useState(false)
-
-  const canEdit = user?.user_id === comment.user_id && !comment.deleted
-  const hasReplies = replies.length > 0
-
-  return (
-    <div className={`comment-item level-${level}`}>
-      <div className="comment-content">
-        <div className="comment-header">
-          <div className="comment-author">
-            <img
-              src={comment.avatar_url || '/default-avatar.png'}
-              alt={comment.username}
-              className="author-avatar"
-            />
-            <div className="author-info">
-              <span className="author-name">{comment.username}</span>
-              <span className="comment-time">
-                {formatDistanceToNow(new Date(comment.created_at), { addSuffix: true })}
-              </span>
-              {comment.edited && (
-                <span className="edited-indicator">(edited)</span>
-              )}
-            </div>
-          </div>
-
-          <div className="comment-meta">
-            {comment.pinned && (
-              <span className="pinned-indicator">📌 Pinned</span>
-            )}
-            {comment.locked && (
-              <span className="locked-indicator">🔒 Locked</span>
-            )}
-          </div>
-        </div>
-
-        <div className="comment-body">
-          {comment.deleted ? (
-            <p className="deleted-message">This comment has been deleted</p>
-          ) : isEditing ? (
-            <CommentEditForm
-              comment={comment}
-              onSave={() => {
-                setIsEditing(false)
-                onUpdate?.()
-              }}
-              onCancel={() => setIsEditing(false)}
-            />
-          ) : (
-            <div className="comment-text">
-              {comment.content}
-            </div>
-          )}
-        </div>
-
-        {!comment.deleted && !isEditing && (
-          <div className="comment-actions">
-            <VotingButtons
-              commentId={comment.id}
-              initialVotes={{
-                upvotes: comment.upvotes,
-                downvotes: comment.downvotes,
-                userVote: comment.user_vote,
-              }}
-              onUpdate={onUpdate}
-            />
-
-            <div className="action-buttons">
-              {user && (
-                <button
-                  onClick={() => setIsReplying(!isReplying)}
-                  className="reply-button"
-                >
-                  Reply
-                </button>
-              )}
-
-              {canEdit && (
-                <button
-                  onClick={() => setIsEditing(true)}
-                  className="edit-button"
-                >
-                  Edit
-                </button>
-              )}
-
-              <CommentActions
-                comment={comment}
-                onUpdate={onUpdate}
-              />
-            </div>
-          </div>
-        )}
-      </div>
-
-      {/* Replies Section */}
-      {hasReplies && (
-        <div className="comment-replies">
-          <button
-            onClick={onToggleReplies}
-            className="toggle-replies-button"
-          >
-            {isExpanded ? 'Hide' : 'Show'} {replies.length} {replies.length === 1 ? 'reply' : 'replies'}
-          </button>
-
-          {isExpanded && (
-            <div className="replies-list">
-              {replies.map(reply => (
-                <CommentItem
-                  key={reply.id}
-                  comment={reply}
-                  replies={[]} // Nested replies would need additional logic
-                  onUpdate={onUpdate}
-                  level={level + 1}
-                />
-              ))}
-            </div>
-          )}
-        </div>
-      )}
-
-      {/* Reply Form */}
-      {isReplying && user && (
-        <div className="reply-form">
-          <CommentForm
-            parentId={comment.id}
-            onSuccess={() => {
-              setIsReplying(false)
-              onUpdate?.()
-            }}
-            onCancel={() => setIsReplying(false)}
-          />
-        </div>
-      )}
-    </div>
-  )
-}
-```
-
-## Custom Hooks
-
-### 1. Comments Hook
+### 1. Comments Hook with Session Auth
 
 ```typescript
 // hooks/useComments.ts
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { commentumAPI } from '../lib/supabase'
+import { commentumClient } from '../lib/commentum-client'
 import { Comment } from '../types/comment'
 
 export const useComments = (mediaId: number) => {
   return useQuery({
     queryKey: ['comments', mediaId],
-    queryFn: () => commentumAPI.request<Comment[]>(`/comments?media_id=${mediaId}`),
+    queryFn: () => commentumClient.getComments(mediaId),
     enabled: !!mediaId,
   })
 }
@@ -562,21 +624,25 @@ export const useCreateComment = () => {
 
   return useMutation({
     mutationFn: (data: {
-      user_id: number
-      media_id: number
+      media_id?: number
+      media_info?: {
+        external_id: string
+        media_type: 'anime' | 'manga' | 'movie' | 'tv' | 'other'
+        title: string
+        year?: number
+        poster_url?: string
+      }
       content: string
       parent_id?: number
-    }) =>
-      commentumAPI.request<Comment>('/comments', {
-        method: 'POST',
-        body: JSON.stringify({
-          action: 'create',
-          ...data,
-        }),
-      }),
+    }) => commentumClient.createComment(data),
     onSuccess: (_, variables) => {
       // Invalidate and refetch comments
-      queryClient.invalidateQueries({ queryKey: ['comments', variables.media_id] })
+      if (variables.media_id) {
+        queryClient.invalidateQueries({ queryKey: ['comments', variables.media_id] })
+      } else {
+        // If using media_info, we don't know the media_id yet
+        queryClient.invalidateQueries({ queryKey: ['comments'] })
+      }
     },
   })
 }
@@ -585,18 +651,10 @@ export const useEditComment = () => {
   const queryClient = useQueryClient()
 
   return useMutation({
-    mutationFn: (data: {
-      user_id: number
-      comment_id: number
+    mutationFn: ({ commentId, content }: {
+      commentId: number
       content: string
-    }) =>
-      commentumAPI.request<Comment>('/comments', {
-        method: 'POST',
-        body: JSON.stringify({
-          action: 'edit',
-          ...data,
-        }),
-      }),
+    }) => commentumClient.editComment(commentId, content),
     onSuccess: () => {
       // Invalidate all comments queries to ensure consistency
       queryClient.invalidateQueries({ queryKey: ['comments'] })
@@ -608,14 +666,7 @@ export const useDeleteComment = () => {
   const queryClient = useQueryClient()
 
   return useMutation({
-    mutationFn: (data: { user_id: number; comment_id: number }) =>
-      commentumAPI.request<Comment>('/comments', {
-        method: 'POST',
-        body: JSON.stringify({
-          action: 'delete',
-          ...data,
-        }),
-      }),
+    mutationFn: (commentId: number) => commentumClient.deleteComment(commentId),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['comments'] })
     },
@@ -623,465 +674,181 @@ export const useDeleteComment = () => {
 }
 ```
 
-### 2. Voting Hook
+### 2. Voting Hook with Session Auth
 
 ```typescript
 // hooks/useVoting.ts
 import { useState, useCallback } from 'react'
-import { commentumAPI } from '../lib/supabase'
+import { commentumClient } from '../lib/commentum-client'
 
-interface VoteData {
-  upvotes: number
-  downvotes: number
-  userVote: number
+interface UseVotingResult {
+  upvote: () => Promise<void>
+  downvote: () => Promise<void>
+  removeVote: () => Promise<void>
+  votes: { upvotes: number; downvotes: number; userVote: number }
+  loading: boolean
+  error: string | null
 }
 
 export const useVoting = (
   commentId: number,
-  initialVotes: VoteData,
-  userId?: number
-) => {
-  const [votes, setVotes] = useState<VoteData>(initialVotes)
+  initialVotes: { upvotes: number; downvotes: number; userVote: number }
+): UseVotingResult => {
+  const [votes, setVotes] = useState(initialVotes)
   const [loading, setLoading] = useState(false)
+  const [error, setError] = useState<string | null>(null)
 
   const vote = useCallback(async (action: 'upvote' | 'downvote' | 'remove') => {
-    if (!userId || loading) return
-
     setLoading(true)
+    setError(null)
 
     try {
-      const response = await commentumAPI.request('/voting', {
-        method: 'POST',
-        body: JSON.stringify({
-          action,
-          user_id: userId,
-          comment_id: commentId,
-        }),
-      })
+      await commentumClient.vote(commentId, action)
 
-      // Update local state based on response
-      if (action === 'remove') {
-        setVotes(prev => ({
-          ...prev,
-          upvotes: prev.userVote === 1 ? prev.upvotes - 1 : prev.upvotes,
-          downvotes: prev.userVote === -1 ? prev.downvotes - 1 : prev.downvotes,
-          userVote: 0,
-        }))
-      } else {
-        const voteType = action === 'upvote' ? 1 : -1
-        setVotes(prev => {
-          const newVotes = { ...prev }
-          
-          // Remove previous vote if different
-          if (prev.userVote === 1 && voteType === -1) {
-            newVotes.upvotes--
-          } else if (prev.userVote === -1 && voteType === 1) {
-            newVotes.downvotes--
-          }
-          
-          // Add new vote if different from previous
-          if (prev.userVote !== voteType) {
-            if (voteType === 1) newVotes.upvotes++
-            else newVotes.downvotes++
-          }
-          
-          newVotes.userVote = prev.userVote === voteType ? 0 : voteType
-          return newVotes
-        })
-      }
-    } catch (error) {
-      console.error('Vote failed:', error)
-      throw error
+      // Update local state based on the action
+      setVotes(prev => {
+        const newVotes = { ...prev }
+        
+        if (action === 'remove') {
+          if (prev.userVote === 1) newVotes.upvotes--
+          if (prev.userVote === -1) newVotes.downvotes--
+          newVotes.userVote = 0
+        } else if (action === 'upvote') {
+          if (prev.userVote === -1) newVotes.downvotes--
+          if (prev.userVote !== 1) newVotes.upvotes++
+          newVotes.userVote = 1
+        } else if (action === 'downvote') {
+          if (prev.userVote === 1) newVotes.upvotes--
+          if (prev.userVote !== -1) newVotes.downvotes++
+          newVotes.userVote = -1
+        }
+        
+        return newVotes
+      })
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Voting failed')
     } finally {
       setLoading(false)
     }
-  }, [commentId, userId, loading])
+  }, [commentId])
 
   return {
-    votes,
-    loading,
     upvote: () => vote('upvote'),
     downvote: () => vote('downvote'),
     removeVote: () => vote('remove'),
-  }
-}
-```
-
-### 3. Toast Hook
-
-```typescript
-// hooks/useToast.ts
-import { useState, useCallback } from 'react'
-
-interface Toast {
-  id: string
-  message: string
-  type: 'success' | 'error' | 'warning' | 'info'
-  duration?: number
-}
-
-export const useToast = () => {
-  const [toasts, setToasts] = useState<Toast[]>([])
-
-  const addToast = useCallback(
-    (message: string, type: Toast['type'] = 'info', duration = 5000) => {
-      const id = Date.now().toString()
-      const toast: Toast = { id, message, type, duration }
-
-      setToasts(prev => [...prev, toast])
-
-      if (duration > 0) {
-        setTimeout(() => {
-          removeToast(id)
-        }, duration)
-      }
-
-      return id
-    },
-    []
-  )
-
-  const removeToast = useCallback((id: string) => {
-    setToasts(prev => prev.filter(toast => toast.id !== id))
-  }, [])
-
-  const success = useCallback((message: string) => addToast(message, 'success'), [addToast])
-  const error = useCallback((message: string) => addToast(message, 'error'), [addToast])
-  const warning = useCallback((message: string) => addToast(message, 'warning'), [addToast])
-  const info = useCallback((message: string) => addToast(message, 'info'), [addToast])
-
-  return {
-    toasts,
-    addToast,
-    removeToast,
-    success,
-    error,
-    warning,
-    info,
+    votes,
+    loading,
+    error
   }
 }
 ```
 
 ## Usage Example
 
+### 1. App Integration
+
 ```typescript
-// pages/media/[id].tsx
-import { GetServerSideProps } from 'next'
+// pages/anime/[id].tsx
+import React from 'react'
+import { AuthProvider } from '../contexts/AuthProvider'
 import { CommentSystemProvider } from '../contexts/CommentSystemProvider'
 import { CommentSystem } from '../components/CommentSystem'
-import { AuthProvider } from '../contexts/AuthContext'
 
-interface MediaPageProps {
-  media: {
-    id: number
-    title: string
-    type: 'anime' | 'manga' | 'movie' | 'tv'
-  }
-}
-
-export default function MediaPage({ media }: MediaPageProps) {
-  // This would come from your auth system
-  const [currentUser, setCurrentUser] = useState<any>(null)
-
+export default function AnimePage({ anime }) {
   return (
     <AuthProvider>
-      <CommentSystemProvider
-        mediaId={media.id}
-        mediaType={media.type}
-        userId={currentUser?.user_id}
+      <CommentSystemProvider 
+        mediaId={anime.id} 
+        mediaType="anime"
       >
-        <div className="media-page">
-          <header>
-            <h1>{media.title}</h1>
-            <p>Type: {media.type}</p>
-          </header>
-
-          <main>
-            <section className="media-content">
-              {/* Your media content here */}
-            </section>
-
-            <section className="comments-section">
-              <CommentSystem />
-            </section>
-          </main>
+        <div className="anime-page">
+          {/* Your anime content */}
+          
+          <div className="comments-section">
+            <CommentSystem />
+          </div>
         </div>
       </CommentSystemProvider>
     </AuthProvider>
   )
 }
+```
 
-export const getServerSideProps: GetServerSideProps = async (context) => {
-  const { id } = context.params
+### 2. With Auto Media Creation
 
-  // Fetch your media data
-  const media = await fetchMediaById(id as string)
+```typescript
+// components/MediaComments.tsx
+import React from 'react'
+import { AuthProvider } from '../contexts/AuthProvider'
+import { CommentSystemProvider } from '../contexts/CommentSystemProvider'
+import { CommentSystem } from './CommentSystem'
 
-  if (!media) {
-    return { notFound: true }
-  }
-
-  return {
-    props: {
-      media,
-    },
+interface MediaCommentsProps {
+  mediaInfo: {
+    external_id: string
+    media_type: 'anime' | 'manga' | 'movie' | 'tv' | 'other'
+    title: string
+    year?: number
+    poster_url?: string
   }
 }
 
-async function fetchMediaById(id: string) {
-  // Implement your media fetching logic
-  return {
-    id: parseInt(id),
-    title: 'Sample Media Title',
-    type: 'anime' as const,
-  }
+export const MediaComments: React.FC<MediaCommentsProps> = ({ mediaInfo }) => {
+  return (
+    <AuthProvider>
+      <CommentSystemProvider 
+        mediaId={undefined} // No media_id - will be created automatically
+        mediaType={mediaInfo.media_type}
+      >
+        <CommentSystem />
+      </CommentSystemProvider>
+    </AuthProvider>
+  )
 }
 ```
 
-## Styling
+## 🔒 Security Features
 
-```css
-/* styles/CommentSystem.css */
-.comment-system {
-  max-width: 800px;
-  margin: 0 auto;
-  padding: 20px;
-}
+### Session-Based Authentication
+- **No user_id parameters**: User identity is extracted from session tokens
+- **Automatic token management**: Tokens are stored and refreshed automatically
+- **Session validation**: All API calls validate the session token
+- **Automatic logout**: Sessions are cleared on expiration
 
-.comment-system-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  margin-bottom: 20px;
-  padding-bottom: 10px;
-  border-bottom: 1px solid #e2e8f0;
-}
+### Zero-Trust Architecture
+- **Server-side validation**: All user data is validated on the server
+- **No client trust**: No client-provided user data is trusted
+- **Real-time verification**: Provider tokens are verified with real APIs
+- **Audit logging**: All actions are logged for security
 
-.comment-form {
-  background: #f8fafc;
-  border-radius: 8px;
-  padding: 16px;
-  margin-bottom: 24px;
-}
+### Error Handling
+- **Session expiration**: Automatic handling of expired sessions
+- **Network errors**: Graceful handling of connection issues
+- **Permission errors**: Clear error messages for permission issues
 
-.comment-textarea {
-  width: 100%;
-  border: 1px solid #d1d5db;
-  border-radius: 6px;
-  padding: 12px;
-  font-size: 14px;
-  line-height: 1.5;
-  resize: vertical;
-  transition: border-color 0.2s;
-}
+## 🚨 Breaking Changes from Old Version
 
-.comment-textarea:focus {
-  outline: none;
-  border-color: #3b82f6;
-  box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1);
-}
-
-.comment-textarea.error {
-  border-color: #ef4444;
-}
-
-.form-actions {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  margin-top: 12px;
-}
-
-.character-count {
-  font-size: 12px;
-  color: #6b7280;
-}
-
-.character-count.warning {
-  color: #f59e0b;
-}
-
-.submit-button, .cancel-button {
-  padding: 8px 16px;
-  border-radius: 6px;
-  font-size: 14px;
-  font-weight: 500;
-  cursor: pointer;
-  transition: all 0.2s;
-}
-
-.submit-button {
-  background: #3b82f6;
-  color: white;
-  border: none;
-}
-
-.submit-button:hover:not(:disabled) {
-  background: #2563eb;
-}
-
-.submit-button:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-
-.cancel-button {
-  background: transparent;
-  color: #6b7280;
-  border: 1px solid #d1d5db;
-  margin-right: 8px;
-}
-
-.cancel-button:hover:not(:disabled) {
-  background: #f3f4f6;
-}
-
-.comment-item {
-  margin-bottom: 16px;
-  border: 1px solid #e5e7eb;
-  border-radius: 8px;
-  overflow: hidden;
-}
-
-.comment-item.level-1 {
-  margin-left: 24px;
-  border-color: #f3f4f6;
-}
-
-.comment-item.level-2 {
-  margin-left: 48px;
-  border-color: #f9fafb;
-}
-
-.comment-content {
-  padding: 16px;
-}
-
-.comment-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: flex-start;
-  margin-bottom: 8px;
-}
-
-.comment-author {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.author-avatar {
-  width: 32px;
-  height: 32px;
-  border-radius: 50%;
-  object-fit: cover;
-}
-
-.author-name {
-  font-weight: 600;
-  color: #1f2937;
-}
-
-.comment-time {
-  font-size: 12px;
-  color: #6b7280;
-  margin-left: 8px;
-}
-
-.edited-indicator {
-  font-size: 12px;
-  color: #9ca3af;
-  font-style: italic;
-}
-
-.comment-text {
-  line-height: 1.6;
-  color: #374151;
-  white-space: pre-wrap;
-}
-
-.comment-actions {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  margin-top: 12px;
-  padding-top: 12px;
-  border-top: 1px solid #f3f4f6;
-}
-
-.action-buttons {
-  display: flex;
-  gap: 8px;
-}
-
-.reply-button, .edit-button {
-  background: transparent;
-  border: none;
-  color: #6b7280;
-  font-size: 12px;
-  cursor: pointer;
-  padding: 4px 8px;
-  border-radius: 4px;
-  transition: all 0.2s;
-}
-
-.reply-button:hover, .edit-button:hover {
-  background: #f3f4f6;
-  color: #374151;
-}
-
-.comment-replies {
-  margin-top: 12px;
-  padding-left: 16px;
-  border-left: 2px solid #e5e7eb;
-}
-
-.toggle-replies-button {
-  background: transparent;
-  border: none;
-  color: #3b82f6;
-  font-size: 12px;
-  cursor: pointer;
-  padding: 4px 0;
-  margin-bottom: 8px;
-}
-
-.toggle-replies-button:hover {
-  text-decoration: underline;
-}
-
-.reply-form {
-  margin-top: 12px;
-  padding-left: 16px;
-}
-
-.loading, .error {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  padding: 40px;
-  text-align: center;
-}
-
-.error-message {
-  color: #ef4444;
-  margin-bottom: 16px;
-}
-
-.retry-button {
-  background: #3b82f6;
-  color: white;
-  border: none;
-  padding: 8px 16px;
-  border-radius: 6px;
-  cursor: pointer;
-}
-
-.no-comments {
-  text-align: center;
-  padding: 40px;
-  color: #6b7280;
-}
+### Before (Vulnerable)
+```typescript
+// ❌ OLD - Client could send any user_id
+await commentumAPI.request('/comments', {
+  method: 'POST',
+  body: JSON.stringify({
+    action: 'create',
+    user_id: 123,  // Could be faked!
+    media_id: 456,
+    content: 'Comment text'
+  })
+})
 ```
 
-This React integration provides a complete, production-ready comment system with modern React patterns, TypeScript support, and comprehensive error handling.
+### After (Secure)
+```typescript
+// ✅ NEW - User ID extracted from session
+await commentumClient.createComment({
+  media_id: 456,
+  content: 'Comment text'  // No user_id needed!
+})
+```
+
+This secure implementation ensures that comment operations can only be performed by authenticated users while preventing identity spoofing attacks.

@@ -1,6 +1,10 @@
-# Vue.js Integration Example
+# 🔒 Vue.js Integration Example - Session-Based Authentication
 
-This example demonstrates how to integrate Commentum into a Vue.js 3 application using TypeScript and the Composition API.
+This example demonstrates how to integrate Commentum into a Vue.js 3 application using TypeScript and the Composition API with **secure session-based authentication**.
+
+## 🚨 Security Notice
+
+This example uses **session-based authentication** to prevent identity spoofing attacks. The `user_id` is never passed from the client - it's extracted from the session token on the server.
 
 ## Project Setup
 
@@ -21,31 +25,59 @@ VITE_SUPABASE_ANON_KEY=your_supabase_anon_key
 VITE_COMMENTUM_API_URL=https://your-project.supabase.co/functions/v1
 ```
 
-### 3. Supabase Client Configuration
+### 3. Secure API Client with Session Management
 
 ```typescript
-// src/lib/supabase.ts
-import { createClient } from '@supabase/supabase-js'
+// src/lib/commentum-client.ts
+export class CommentumClient {
+  private baseURL: string
+  private sessionToken: string | null = null
 
-const supabaseUrl = import.meta.env.VITE_SUPABASE_URL
-const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY
+  constructor(baseURL: string) {
+    this.baseURL = baseURL
+    this.loadSessionToken()
+  }
 
-export const supabase = createClient(supabaseUrl, supabaseAnonKey)
+  private loadSessionToken() {
+    if (typeof window !== 'undefined') {
+      this.sessionToken = localStorage.getItem('commentum_session_token')
+    }
+  }
 
-// Commentum API client
-export const commentumAPI = {
-  baseURL: import.meta.env.VITE_COMMENTUM_API_URL,
-  
-  async request<T>(endpoint: string, options: RequestInit = {}): Promise<T> {
+  setSessionToken(token: string) {
+    this.sessionToken = token
+    if (typeof window !== 'undefined') {
+      localStorage.setItem('commentum_session_token', token)
+    }
+  }
+
+  clearSessionToken() {
+    this.sessionToken = null
+    if (typeof window !== 'undefined') {
+      localStorage.removeItem('commentum_session_token')
+    }
+  }
+
+  private async request<T>(endpoint: string, options: RequestInit = {}): Promise<T> {
+    if (!this.sessionToken) {
+      throw new Error('Not authenticated - Please log in first')
+    }
+
     const url = `${this.baseURL}${endpoint}`
     
     const response = await fetch(url, {
       headers: {
         'Content-Type': 'application/json',
+        'Authorization': `Bearer ${this.sessionToken}`,
         ...options.headers,
       },
       ...options,
     })
+    
+    if (response.status === 401) {
+      this.clearSessionToken()
+      throw new Error('Session expired - Please log in again')
+    }
     
     if (!response.ok) {
       const error = await response.json()
@@ -54,19 +86,217 @@ export const commentumAPI = {
     
     return response.json()
   }
+
+  // Identity Resolution
+  async resolveIdentity(clientType: string, token: string) {
+    const response = await fetch(`${this.baseURL}/identity-resolve`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${import.meta.env.VITE_SUPABASE_ANON_KEY}`,
+      },
+      body: JSON.stringify({
+        client_type: clientType,
+        token: token,
+      }),
+    })
+
+    if (!response.ok) {
+      const error = await response.json()
+      throw new Error(error.error || 'Identity resolution failed')
+    }
+
+    const data = await response.json()
+    this.setSessionToken(data.session_token)
+    return data
+  }
+
+  // Comments API
+  async getComments(mediaId: number) {
+    return this.request(`/comments?media_id=${mediaId}`)
+  }
+
+  async createComment(data: {
+    media_id?: number
+    media_info?: {
+      external_id: string
+      media_type: 'anime' | 'manga' | 'movie' | 'tv' | 'other'
+      title: string
+      year?: number
+      poster_url?: string
+    }
+    content: string
+    parent_id?: number
+  }) {
+    return this.request('/comments', {
+      method: 'POST',
+      body: JSON.stringify({
+        action: 'create',
+        ...data,
+      }),
+    })
+  }
+
+  async editComment(commentId: number, content: string) {
+    return this.request('/comments', {
+      method: 'POST',
+      body: JSON.stringify({
+        action: 'edit',
+        comment_id: commentId,
+        content,
+      }),
+    })
+  }
+
+  async deleteComment(commentId: number) {
+    return this.request('/comments', {
+      method: 'POST',
+      body: JSON.stringify({
+        action: 'delete',
+        comment_id: commentId,
+      }),
+    })
+  }
+
+  // Voting API
+  async vote(commentId: number, action: 'upvote' | 'downvote' | 'remove') {
+    return this.request('/voting', {
+      method: 'POST',
+      body: JSON.stringify({
+        action,
+        comment_id: commentId,
+      }),
+    })
+  }
+
+  // Reports API
+  async createReport(commentId: number, reason: string, notes?: string) {
+    return this.request('/reports', {
+      method: 'POST',
+      body: JSON.stringify({
+        action: 'create',
+        comment_id: commentId,
+        reason,
+        notes,
+      }),
+    })
+  }
 }
+
+export const commentumClient = new CommentumClient(
+  import.meta.env.VITE_COMMENTUM_API_URL
+)
 ```
 
-## Stores and Composables
+## Secure Stores and Composables
 
-### 1. Comment Store (Pinia)
+### 1. Auth Store with Session Management
+
+```typescript
+// src/stores/authStore.ts
+import { defineStore } from 'pinia'
+import { ref, computed } from 'vue'
+import { commentumClient } from '@/lib/commentum-client'
+
+export interface User {
+  id: number
+  username: string
+  avatar_url?: string
+  client_type: 'anilist' | 'mal' | 'simkl'
+}
+
+export const useAuthStore = defineStore('auth', () => {
+  // State
+  const user = ref<User | null>(null)
+  const sessionToken = ref<string | null>(null)
+  const loading = ref(false)
+  const error = ref<string | null>(null)
+
+  // Getters
+  const isAuthenticated = computed(() => !!user.value)
+  const isModerator = computed(() => 
+    user.value?.role === 'moderator' || user.value?.role === 'admin' || user.value?.role === 'super_admin'
+  )
+  const isAdmin = computed(() => 
+    user.value?.role === 'admin' || user.value?.role === 'super_admin'
+  )
+
+  // Actions
+  const login = async (clientType: string, token: string) => {
+    loading.value = true
+    error.value = null
+
+    try {
+      const data = await commentumClient.resolveIdentity(clientType, token)
+      
+      if (data.user.banned) {
+        throw new Error('Account is banned')
+      }
+
+      if (data.user.muted_until && new Date(data.user.muted_until) > new Date()) {
+        throw new Error(`Account muted until ${data.user.muted_until}`)
+      }
+
+      user.value = data.user
+      sessionToken.value = data.session_token
+      
+      return data
+    } catch (err) {
+      error.value = err instanceof Error ? err.message : 'Authentication failed'
+      throw err
+    } finally {
+      loading.value = false
+    }
+  }
+
+  const logout = () => {
+    user.value = null
+    sessionToken.value = null
+    commentumClient.clearSessionToken()
+  }
+
+  const initializeAuth = () => {
+    const token = localStorage.getItem('commentum_session_token')
+    if (token) {
+      sessionToken.value = token
+      commentumClient.setSessionToken(token)
+      // You might want to validate the token here
+    }
+  }
+
+  const clearError = () => {
+    error.value = null
+  }
+
+  return {
+    // State
+    user: readonly(user),
+    sessionToken: readonly(sessionToken),
+    loading: readonly(loading),
+    error: readonly(error),
+    
+    // Getters
+    isAuthenticated,
+    isModerator,
+    isAdmin,
+    
+    // Actions
+    login,
+    logout,
+    initializeAuth,
+    clearError,
+  }
+})
+```
+
+### 2. Comment Store with Session Auth
 
 ```typescript
 // src/stores/commentStore.ts
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
-import { commentumAPI } from '@/lib/supabase'
-import type { Comment, CreateCommentData } from '@/types/comment'
+import { commentumClient } from '@/lib/commentum-client'
+import type { Comment } from '@/types/comment'
 
 export const useCommentStore = defineStore('comments', () => {
   // State
@@ -105,7 +335,7 @@ export const useCommentStore = defineStore('comments', () => {
     error.value = null
 
     try {
-      const response = await commentumAPI.request<Comment[]>(`/comments?media_id=${mediaId}`)
+      const response = await commentumClient.getComments(mediaId)
       comments.value = response
     } catch (err) {
       error.value = err instanceof Error ? err.message : 'Failed to fetch comments'
@@ -115,16 +345,20 @@ export const useCommentStore = defineStore('comments', () => {
     }
   }
 
-  const createComment = async (data: CreateCommentData) => {
+  const createComment = async (data: {
+    media_id?: number
+    media_info?: {
+      external_id: string
+      media_type: 'anime' | 'manga' | 'movie' | 'tv' | 'other'
+      title: string
+      year?: number
+      poster_url?: string
+    }
+    content: string
+    parent_id?: number
+  }) => {
     try {
-      const response = await commentumAPI.request<Comment>('/comments', {
-        method: 'POST',
-        body: JSON.stringify({
-          action: 'create',
-          ...data,
-        }),
-      })
-
+      const response = await commentumClient.createComment(data)
       comments.value.push(response)
       return response
     } catch (err) {
@@ -133,17 +367,9 @@ export const useCommentStore = defineStore('comments', () => {
     }
   }
 
-  const updateComment = async (commentId: number, content: string, userId: number) => {
+  const updateComment = async (commentId: number, content: string) => {
     try {
-      const response = await commentumAPI.request<Comment>('/comments', {
-        method: 'POST',
-        body: JSON.stringify({
-          action: 'edit',
-          user_id: userId,
-          comment_id: commentId,
-          content,
-        }),
-      })
+      const response = await commentumClient.editComment(commentId, content)
 
       const index = comments.value.findIndex(c => c.id === commentId)
       if (index !== -1) {
@@ -157,16 +383,9 @@ export const useCommentStore = defineStore('comments', () => {
     }
   }
 
-  const deleteComment = async (commentId: number, userId: number) => {
+  const deleteComment = async (commentId: number) => {
     try {
-      const response = await commentumAPI.request<Comment>('/comments', {
-        method: 'POST',
-        body: JSON.stringify({
-          action: 'delete',
-          user_id: userId,
-          comment_id: commentId,
-        }),
-      })
+      const response = await commentumClient.deleteComment(commentId)
 
       const index = comments.value.findIndex(c => c.id === commentId)
       if (index !== -1) {
@@ -205,130 +424,15 @@ export const useCommentStore = defineStore('comments', () => {
 })
 ```
 
-### 2. Auth Store
-
-```typescript
-// src/stores/authStore.ts
-import { defineStore } from 'pinia'
-import { ref, computed } from 'vue'
-import { commentumAPI } from '@/lib/supabase'
-import type { UserIdentity } from '@/types/auth'
-
-export const useAuthStore = defineStore('auth', () => {
-  // State
-  const user = ref<UserIdentity | null>(null)
-  const loading = ref(false)
-  const error = ref<string | null>(null)
-
-  // Getters
-  const isAuthenticated = computed(() => !!user.value)
-  const isModerator = computed(() => 
-    user.value?.role === 'moderator' || user.value?.role === 'admin' || user.value?.role === 'super_admin'
-  )
-  const isAdmin = computed(() => 
-    user.value?.role === 'admin' || user.value?.role === 'super_admin'
-  )
-
-  // Actions
-  const resolveIdentity = async (
-    clientType: 'anilist' | 'myanimelist' | 'simkl',
-    clientUserId: string,
-    username: string,
-    avatarUrl?: string
-  ) => {
-    loading.value = true
-    error.value = null
-
-    try {
-      const response = await commentumAPI.request<UserIdentity>('/identity-resolve', {
-        method: 'POST',
-        body: JSON.stringify({
-          client_type: clientType,
-          client_user_id: clientUserId,
-          username,
-          avatar_url: avatarUrl,
-        }),
-      })
-
-      if (response.banned) {
-        throw new Error('Account is banned')
-      }
-
-      if (response.muted_until && new Date(response.muted_until) > new Date()) {
-        throw new Error(`Account muted until ${response.muted_until}`)
-      }
-
-      user.value = response
-      
-      // Store in localStorage for persistence
-      localStorage.setItem('commentum_user', JSON.stringify({
-        user: response,
-        expiresAt: Date.now() + (24 * 60 * 60 * 1000), // 24 hours
-      }))
-
-      return response
-    } catch (err) {
-      error.value = err instanceof Error ? err.message : 'Authentication failed'
-      throw err
-    } finally {
-      loading.value = false
-    }
-  }
-
-  const logout = () => {
-    user.value = null
-    localStorage.removeItem('commentum_user')
-  }
-
-  const initializeAuth = () => {
-    const stored = localStorage.getItem('commentum_user')
-    if (stored) {
-      try {
-        const data = JSON.parse(stored)
-        if (data.expiresAt > Date.now()) {
-          user.value = data.user
-        } else {
-          localStorage.removeItem('commentum_user')
-        }
-      } catch (err) {
-        localStorage.removeItem('commentum_user')
-      }
-    }
-  }
-
-  const clearError = () => {
-    error.value = null
-  }
-
-  return {
-    // State
-    user: readonly(user),
-    loading: readonly(loading),
-    error: readonly(error),
-    
-    // Getters
-    isAuthenticated,
-    isModerator,
-    isAdmin,
-    
-    // Actions
-    resolveIdentity,
-    logout,
-    initializeAuth,
-    clearError,
-  }
-})
-```
-
-### 3. Voting Composable
+### 3. Voting Composable with Session Auth
 
 ```typescript
 // src/composables/useVoting.ts
 import { ref, computed } from 'vue'
-import { commentumAPI } from '@/lib/supabase'
+import { commentumClient } from '@/lib/commentum-client'
 import type { VoteData } from '@/types/voting'
 
-export function useVoting(commentId: number, initialVotes: VoteData, userId?: number) {
+export function useVoting(commentId: number, initialVotes: VoteData) {
   // State
   const votes = ref<VoteData>({ ...initialVotes })
   const loading = ref(false)
@@ -339,19 +443,12 @@ export function useVoting(commentId: number, initialVotes: VoteData, userId?: nu
 
   // Actions
   const vote = async (action: 'upvote' | 'downvote' | 'remove') => {
-    if (!userId || loading.value) return
+    if (loading.value) return
 
     loading.value = true
 
     try {
-      const response = await commentumAPI.request('/voting', {
-        method: 'POST',
-        body: JSON.stringify({
-          action,
-          user_id: userId,
-          comment_id: commentId,
-        }),
-      })
+      await commentumClient.vote(commentId, action)
 
       // Update local state based on action
       if (action === 'remove') {
@@ -379,8 +476,6 @@ export function useVoting(commentId: number, initialVotes: VoteData, userId?: nu
         
         votes.value.userVote = votes.value.userVote === voteType ? 0 : voteType
       }
-
-      return response
     } catch (error) {
       console.error('Vote failed:', error)
       throw error
@@ -410,64 +505,151 @@ export function useVoting(commentId: number, initialVotes: VoteData, userId?: nu
 }
 ```
 
-### 4. Toast Composable
+## Secure Components
 
-```typescript
-// src/composables/useToast.ts
+### 1. Login Component
+
+```vue
+<!-- src/components/LoginForm.vue -->
+<template>
+  <div class="login-form">
+    <h3>Login to Comment</h3>
+    <form @submit.prevent="handleSubmit">
+      <div class="form-group">
+        <label>Service:</label>
+        <select
+          v-model="clientType"
+          :disabled="loading"
+        >
+          <option value="anilist">AniList</option>
+          <option value="mal">MyAnimeList</option>
+          <option value="simkl">SIMKL</option>
+        </select>
+      </div>
+
+      <div class="form-group">
+        <label>Access Token:</label>
+        <input
+          v-model="token"
+          type="password"
+          placeholder="Enter your access token"
+          :disabled="loading"
+          required
+        />
+        <small>
+          Get your token from your service's developer settings
+        </small>
+      </div>
+
+      <div v-if="error" class="error">{{ error }}</div>
+
+      <button 
+        type="submit" 
+        :disabled="loading || !token.trim()"
+      >
+        {{ loading ? 'Logging in...' : 'Login' }}
+      </button>
+    </form>
+  </div>
+</template>
+
+<script setup lang="ts">
 import { ref } from 'vue'
+import { useAuthStore } from '@/stores/authStore'
 
-interface Toast {
-  id: string
-  message: string
-  type: 'success' | 'error' | 'warning' | 'info'
-  duration?: number
+interface Props {
+  onSuccess?: () => void
 }
 
-export function useToast() {
-  const toasts = ref<Toast[]>([])
+const props = defineProps<Props>()
 
-  const addToast = (message: string, type: Toast['type'] = 'info', duration = 5000) => {
-    const id = Date.now().toString()
-    const toast: Toast = { id, message, type, duration }
+const authStore = useAuthStore()
+const clientType = ref<'anilist' | 'mal' | 'simkl'>('anilist')
+const token = ref('')
+const loading = ref(false)
+const error = ref<string | null>(null)
 
-    toasts.value.push(toast)
+const handleSubmit = async () => {
+  if (!token.value.trim()) return
 
-    if (duration > 0) {
-      setTimeout(() => {
-        removeToast(id)
-      }, duration)
-    }
+  loading.value = true
+  error.value = null
 
-    return id
-  }
-
-  const removeToast = (id: string) => {
-    const index = toasts.value.findIndex(toast => toast.id === id)
-    if (index > -1) {
-      toasts.value.splice(index, 1)
-    }
-  }
-
-  const success = (message: string) => addToast(message, 'success')
-  const error = (message: string) => addToast(message, 'error')
-  const warning = (message: string) => addToast(message, 'warning')
-  const info = (message: string) => addToast(message, 'info')
-
-  return {
-    toasts: readonly(toasts),
-    addToast,
-    removeToast,
-    success,
-    error,
-    warning,
-    info,
+  try {
+    await authStore.login(clientType.value, token.value.trim())
+    props.onSuccess?.()
+  } catch (err) {
+    error.value = err instanceof Error ? err.message : 'Login failed'
+  } finally {
+    loading.value = false
   }
 }
+</script>
+
+<style scoped>
+.login-form {
+  max-width: 400px;
+  margin: 0 auto;
+  padding: 24px;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  background: white;
+}
+
+.form-group {
+  margin-bottom: 16px;
+}
+
+.form-group label {
+  display: block;
+  margin-bottom: 4px;
+  font-weight: 500;
+}
+
+.form-group input,
+.form-group select {
+  width: 100%;
+  padding: 8px 12px;
+  border: 1px solid #d1d5db;
+  border-radius: 4px;
+  font-size: 14px;
+}
+
+.form-group small {
+  display: block;
+  margin-top: 4px;
+  color: #6b7280;
+  font-size: 12px;
+}
+
+.error {
+  color: #ef4444;
+  margin-bottom: 16px;
+  padding: 8px;
+  background: #fef2f2;
+  border: 1px solid #fecaca;
+  border-radius: 4px;
+}
+
+button {
+  width: 100%;
+  padding: 10px;
+  background: #3b82f6;
+  color: white;
+  border: none;
+  border-radius: 4px;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+button:disabled {
+  background: #9ca3af;
+  cursor: not-allowed;
+}
+</style>
 ```
 
-## Components
-
-### 1. Comment System Component
+### 2. Comment System Component
 
 ```vue
 <!-- src/components/CommentSystem.vue -->
@@ -480,6 +662,10 @@ export function useToast() {
 
     <div v-if="authStore.isAuthenticated" class="comment-form-section">
       <CommentForm @success="handleCommentSuccess" />
+    </div>
+    <div v-else class="login-prompt">
+      <p>Please log in to comment</p>
+      <LoginForm @success="handleLoginSuccess" />
     </div>
 
     <div class="comments-section">
@@ -518,6 +704,7 @@ import { useAuthStore } from '@/stores/authStore'
 import CommentForm from './CommentForm.vue'
 import CommentItem from './CommentItem.vue'
 import CommentSort from './CommentSort.vue'
+import LoginForm from './LoginForm.vue'
 
 interface Props {
   mediaId: number
@@ -544,6 +731,11 @@ const loadComments = async () => {
 }
 
 const handleCommentSuccess = () => {
+  loadComments()
+}
+
+const handleLoginSuccess = () => {
+  // Refresh comments after login
   loadComments()
 }
 
@@ -576,6 +768,20 @@ watch(() => props.mediaId, () => {
 
 .comment-form-section {
   margin-bottom: 24px;
+}
+
+.login-prompt {
+  margin-bottom: 24px;
+  padding: 20px;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  text-align: center;
+}
+
+.login-prompt p {
+  margin-bottom: 16px;
+  color: #6b7280;
 }
 
 .comments-section {
@@ -619,7 +825,7 @@ watch(() => props.mediaId, () => {
 </style>
 ```
 
-### 2. Comment Form Component
+### 3. Secure Comment Form Component
 
 ```vue
 <!-- src/components/CommentForm.vue -->
@@ -670,65 +876,79 @@ watch(() => props.mediaId, () => {
 <script setup lang="ts">
 import { ref, computed } from 'vue'
 import { useCommentStore } from '@/stores/commentStore'
-import { useAuthStore } from '@/stores/authStore'
 import { useToast } from '@/composables/useToast'
 
 interface Props {
   parentId?: number
+  mediaId?: number
+  mediaInfo?: {
+    external_id: string
+    media_type: 'anime' | 'manga' | 'movie' | 'tv' | 'other'
+    title: string
+    year?: number
+    poster_url?: string
+  }
   onSuccess?: () => void
   onCancel?: () => void
 }
 
-const props = withDefaults(defineProps<Props>(), {
-  placeholder: 'Share your thoughts...',
-  buttonText: 'Post Comment',
-})
-
-const emit = defineEmits<{
-  success: []
-}>()
+const props = defineProps<Props>()
 
 const commentStore = useCommentStore()
-const authStore = useAuthStore()
 const { success, error } = useToast()
 
 const formData = ref({
   content: '',
 })
 
-const errors = ref<Record<string, string>>({})
 const submitting = ref(false)
+const errors = ref<Record<string, string>>({})
+
+const placeholder = computed(() => 
+  props.parentId ? 'Write a reply...' : 'Share your thoughts...'
+)
+
+const buttonText = computed(() => 
+  props.parentId ? 'Reply' : 'Post Comment'
+)
 
 const characterCount = computed(() => formData.value.content.length)
 
 const validateForm = () => {
-  errors.value = {}
+  const newErrors: Record<string, string> = {}
 
   if (!formData.value.content.trim()) {
-    errors.value.content = 'Comment cannot be empty'
+    newErrors.content = 'Comment cannot be empty'
   } else if (formData.value.content.length > 10000) {
-    errors.value.content = 'Comment cannot exceed 10,000 characters'
+    newErrors.content = 'Comment cannot exceed 10,000 characters'
   }
 
-  return Object.keys(errors.value).length === 0
+  errors.value = newErrors
+  return Object.keys(newErrors).length === 0
 }
 
 const handleSubmit = async () => {
-  if (!validateForm() || !authStore.user) return
+  if (!validateForm()) return
 
   submitting.value = true
 
   try {
-    await commentStore.createComment({
-      user_id: authStore.user.user_id,
-      media_id: 0, // This should be passed as a prop
+    const commentData: any = {
       content: formData.value.content.trim(),
       parent_id: props.parentId,
-    })
+    }
+
+    // Use media_id if provided, otherwise use media_info for auto-creation
+    if (props.mediaId) {
+      commentData.media_id = props.mediaId
+    } else if (props.mediaInfo) {
+      commentData.media_info = props.mediaInfo
+    }
+
+    await commentStore.createComment(commentData)
 
     formData.value.content = ''
     success('Comment posted successfully!')
-    emit('success')
     props.onSuccess?.()
   } catch (err) {
     error(err instanceof Error ? err.message : 'Failed to post comment')
@@ -740,24 +960,22 @@ const handleSubmit = async () => {
 
 <style scoped>
 .comment-form {
-  background: #f8fafc;
-  border-radius: 8px;
-  padding: 16px;
+  margin-bottom: 16px;
 }
 
 .form-group {
-  margin-bottom: 12px;
+  margin-bottom: 16px;
 }
 
 .comment-textarea {
   width: 100%;
+  padding: 12px;
   border: 1px solid #d1d5db;
   border-radius: 6px;
-  padding: 12px;
   font-size: 14px;
   line-height: 1.5;
   resize: vertical;
-  transition: border-color 0.2s;
+  min-height: 80px;
 }
 
 .comment-textarea:focus {
@@ -772,14 +990,19 @@ const handleSubmit = async () => {
 
 .error-message {
   display: block;
-  font-size: 12px;
-  color: #ef4444;
   margin-top: 4px;
+  color: #ef4444;
+  font-size: 12px;
 }
 
 .form-actions {
   display: flex;
   justify-content: space-between;
+  align-items: center;
+}
+
+.form-left {
+  display: flex;
   align-items: center;
 }
 
@@ -792,7 +1015,13 @@ const handleSubmit = async () => {
   color: #f59e0b;
 }
 
-.submit-button, .cancel-button {
+.form-right {
+  display: flex;
+  gap: 8px;
+}
+
+.cancel-button,
+.submit-button {
   padding: 8px 16px;
   border-radius: 6px;
   font-size: 14px;
@@ -801,627 +1030,191 @@ const handleSubmit = async () => {
   transition: all 0.2s;
 }
 
+.cancel-button {
+  background: #f3f4f6;
+  color: #374151;
+  border: 1px solid #d1d5db;
+}
+
+.cancel-button:hover:not(:disabled) {
+  background: #e5e7eb;
+}
+
 .submit-button {
   background: #3b82f6;
   color: white;
-  border: none;
+  border: 1px solid #3b82f6;
 }
 
 .submit-button:hover:not(:disabled) {
   background: #2563eb;
 }
 
+.cancel-button:disabled,
 .submit-button:disabled {
-  opacity: 0.5;
+  opacity: 0.6;
   cursor: not-allowed;
-}
-
-.cancel-button {
-  background: transparent;
-  color: #6b7280;
-  border: 1px solid #d1d5db;
-  margin-right: 8px;
-}
-
-.cancel-button:hover:not(:disabled) {
-  background: #f3f4f6;
-}
-</style>
-```
-
-### 3. Comment Item Component
-
-```vue
-<!-- src/components/CommentItem.vue -->
-<template>
-  <div :class="['comment-item', `level-${level}`]">
-    <div class="comment-content">
-      <div class="comment-header">
-        <div class="comment-author">
-          <img
-            :src="comment.avatar_url || '/default-avatar.png'"
-            :alt="comment.username"
-            class="author-avatar"
-          />
-          <div class="author-info">
-            <span class="author-name">{{ comment.username }}</span>
-            <span class="comment-time">{{ formattedTime }}</span>
-            <span v-if="comment.edited" class="edited-indicator">(edited)</span>
-          </div>
-        </div>
-
-        <div class="comment-meta">
-          <span v-if="comment.pinned" class="pinned-indicator">📌 Pinned</span>
-          <span v-if="comment.locked" class="locked-indicator">🔒 Locked</span>
-        </div>
-      </div>
-
-      <div class="comment-body">
-        <p v-if="comment.deleted" class="deleted-message">This comment has been deleted</p>
-        <div v-else-if="isEditing" class="edit-form">
-          <CommentEditForm
-            :comment="comment"
-            @save="handleEditSave"
-            @cancel="isEditing = false"
-          />
-        </div>
-        <div v-else class="comment-text">{{ comment.content }}</div>
-      </div>
-
-      <div v-if="!comment.deleted && !isEditing" class="comment-actions">
-        <VotingButtons
-          :comment-id="comment.id"
-          :initial-votes="{
-            upvotes: comment.upvotes,
-            downvotes: comment.downvotes,
-            userVote: comment.user_vote,
-          }"
-          @update="$emit('update')"
-        />
-
-        <div class="action-buttons">
-          <button
-            v-if="authStore.isAuthenticated"
-            @click="toggleReplyForm"
-            class="reply-button"
-          >
-            Reply
-          </button>
-
-          <button
-            v-if="canEdit"
-            @click="isEditing = true"
-            class="edit-button"
-          >
-            Edit
-          </button>
-
-          <CommentActions
-            :comment="comment"
-            @update="$emit('update')"
-          />
-        </div>
-      </div>
-    </div>
-
-    <!-- Replies Section -->
-    <div v-if="hasReplies" class="comment-replies">
-      <button @click="toggleReplies" class="toggle-replies-button">
-        {{ isExpanded ? 'Hide' : 'Show' }} {{ replies.length }} {{ replies.length === 1 ? 'reply' : 'replies' }}
-      </button>
-
-      <div v-if="isExpanded" class="replies-list">
-        <CommentItem
-          v-for="reply in replies"
-          :key="reply.id"
-          :comment="reply"
-          :level="level + 1"
-          @update="$emit('update')"
-        />
-      </div>
-    </div>
-
-    <!-- Reply Form -->
-    <div v-if="showReplyForm && authStore.isAuthenticated" class="reply-form">
-      <CommentForm
-        :parent-id="comment.id"
-        @success="handleReplySuccess"
-        @cancel="showReplyForm = false"
-        :button-text="'Reply'"
-        :placeholder="'Write a reply...'"
-      />
-    </div>
-  </div>
-</template>
-
-<script setup lang="ts">
-import { ref, computed } from 'vue'
-import { formatDistanceToNow } from 'date-fns'
-import { useAuthStore } from '@/stores/authStore'
-import type { Comment } from '@/types/comment'
-import VotingButtons from './VotingButtons.vue'
-import CommentActions from './CommentActions.vue'
-import CommentEditForm from './CommentEditForm.vue'
-import CommentForm from './CommentForm.vue'
-
-interface Props {
-  comment: Comment
-  replies?: Comment[]
-  level?: number
-}
-
-const props = withDefaults(defineProps<Props>(), {
-  replies: () => [],
-  level: 0,
-})
-
-defineEmits<{
-  update: []
-}>()
-
-const authStore = useAuthStore()
-
-const isEditing = ref(false)
-const showReplyForm = ref(false)
-const isExpanded = ref(false)
-
-const formattedTime = computed(() => 
-  formatDistanceToNow(new Date(props.comment.created_at), { addSuffix: true })
-)
-
-const canEdit = computed(() => 
-  authStore.user?.user_id === props.comment.user_id && !props.comment.deleted
-)
-
-const hasReplies = computed(() => props.replies.length > 0)
-
-const toggleReplies = () => {
-  isExpanded.value = !isExpanded.value
-}
-
-const toggleReplyForm = () => {
-  showReplyForm.value = !showReplyForm.value
-}
-
-const handleEditSave = () => {
-  isEditing.value = false
-  // Emit update to refresh parent
-}
-
-const handleReplySuccess = () => {
-  showReplyForm.value = false
-  // Emit update to refresh parent
-}
-</script>
-
-<style scoped>
-.comment-item {
-  margin-bottom: 16px;
-  border: 1px solid #e5e7eb;
-  border-radius: 8px;
-  overflow: hidden;
-}
-
-.comment-item.level-1 {
-  margin-left: 24px;
-  border-color: #f3f4f6;
-}
-
-.comment-item.level-2 {
-  margin-left: 48px;
-  border-color: #f9fafb;
-}
-
-.comment-content {
-  padding: 16px;
-}
-
-.comment-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: flex-start;
-  margin-bottom: 8px;
-}
-
-.comment-author {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.author-avatar {
-  width: 32px;
-  height: 32px;
-  border-radius: 50%;
-  object-fit: cover;
-}
-
-.author-name {
-  font-weight: 600;
-  color: #1f2937;
-}
-
-.comment-time {
-  font-size: 12px;
-  color: #6b7280;
-  margin-left: 8px;
-}
-
-.edited-indicator {
-  font-size: 12px;
-  color: #9ca3af;
-  font-style: italic;
-}
-
-.comment-text {
-  line-height: 1.6;
-  color: #374151;
-  white-space: pre-wrap;
-}
-
-.deleted-message {
-  font-style: italic;
-  color: #6b7280;
-}
-
-.comment-actions {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  margin-top: 12px;
-  padding-top: 12px;
-  border-top: 1px solid #f3f4f6;
-}
-
-.action-buttons {
-  display: flex;
-  gap: 8px;
-}
-
-.reply-button, .edit-button {
-  background: transparent;
-  border: none;
-  color: #6b7280;
-  font-size: 12px;
-  cursor: pointer;
-  padding: 4px 8px;
-  border-radius: 4px;
-  transition: all 0.2s;
-}
-
-.reply-button:hover, .edit-button:hover {
-  background: #f3f4f6;
-  color: #374151;
-}
-
-.comment-replies {
-  margin-top: 12px;
-  padding-left: 16px;
-  border-left: 2px solid #e5e7eb;
-}
-
-.toggle-replies-button {
-  background: transparent;
-  border: none;
-  color: #3b82f6;
-  font-size: 12px;
-  cursor: pointer;
-  padding: 4px 0;
-  margin-bottom: 8px;
-}
-
-.toggle-replies-button:hover {
-  text-decoration: underline;
-}
-
-.replies-list {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-}
-
-.reply-form {
-  margin-top: 12px;
-  padding-left: 16px;
-}
-</style>
-```
-
-### 4. Voting Buttons Component
-
-```vue
-<!-- src/components/VotingButtons.vue -->
-<template>
-  <div class="voting-buttons">
-    <button
-      @click="handleUpvote"
-      :disabled="loading || !userId"
-      :class="['vote-button', 'upvote', { voted: votes.userVote === 1 }]"
-    >
-      ▲ {{ votes.upvotes }}
-    </button>
-    
-    <button
-      @click="handleDownvote"
-      :disabled="loading || !userId"
-      :class="['vote-button', 'downvote', { voted: votes.userVote === -1 }]"
-    >
-      ▼ {{ votes.downvotes }}
-    </button>
-  </div>
-</template>
-
-<script setup lang="ts">
-import { useVoting } from '@/composables/useVoting'
-import type { VoteData } from '@/types/voting'
-
-interface Props {
-  commentId: number
-  initialVotes: VoteData
-  userId?: number
-}
-
-const props = defineProps<Props>()
-
-const emit = defineEmits<{
-  update: []
-}>()
-
-const { votes, loading, upvote, downvote, removeVote } = useVoting(
-  props.commentId,
-  props.initialVotes,
-  props.userId
-)
-
-const handleUpvote = async () => {
-  try {
-    if (votes.userVote === 1) {
-      await removeVote()
-    } else {
-      await upvote()
-    }
-    emit('update')
-  } catch (error) {
-    console.error('Upvote failed:', error)
-  }
-}
-
-const handleDownvote = async () => {
-  try {
-    if (votes.userVote === -1) {
-      await removeVote()
-    } else {
-      await downvote()
-    }
-    emit('update')
-  } catch (error) {
-    console.error('Downvote failed:', error)
-  }
-}
-</script>
-
-<style scoped>
-.voting-buttons {
-  display: flex;
-  gap: 8px;
-}
-
-.vote-button {
-  background: transparent;
-  border: 1px solid #d1d5db;
-  border-radius: 6px;
-  padding: 4px 8px;
-  font-size: 12px;
-  cursor: pointer;
-  transition: all 0.2s;
-  display: flex;
-  align-items: center;
-  gap: 4px;
-}
-
-.vote-button:hover:not(:disabled) {
-  background: #f3f4f6;
-}
-
-.vote-button:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-
-.vote-button.voted {
-  background: #3b82f6;
-  color: white;
-  border-color: #3b82f6;
-}
-
-.vote-button.upvote.voted {
-  background: #10b981;
-  border-color: #10b981;
-}
-
-.vote-button.downvote.voted {
-  background: #ef4444;
-  border-color: #ef4444;
 }
 </style>
 ```
 
 ## Usage Example
 
-```vue
-<!-- src/views/MediaView.vue -->
-<template>
-  <div class="media-page">
-    <header>
-      <h1>{{ media?.title }}</h1>
-      <p>Type: {{ media?.type }}</p>
-    </header>
-
-    <main>
-      <section class="media-content">
-        <!-- Your media content here -->
-      </section>
-
-      <section class="comments-section">
-        <CommentSystem
-          v-if="media"
-          :media-id="media.id"
-          :media-type="media.type"
-        />
-      </section>
-    </main>
-  </div>
-</template>
-
-<script setup lang="ts">
-import { ref, onMounted } from 'vue'
-import { useAuthStore } from '@/stores/authStore'
-import CommentSystem from '@/components/CommentSystem.vue'
-
-interface Media {
-  id: number
-  title: string
-  type: 'anime' | 'manga' | 'movie' | 'tv'
-}
-
-const media = ref<Media | null>(null)
-const authStore = useAuthStore()
-
-// Initialize auth on app start
-onMounted(() => {
-  authStore.initializeAuth()
-  fetchMedia()
-})
-
-const fetchMedia = async () => {
-  // Implement your media fetching logic
-  media.value = {
-    id: 123,
-    title: 'Sample Media Title',
-    type: 'anime',
-  }
-}
-</script>
-
-<style scoped>
-.media-page {
-  max-width: 1200px;
-  margin: 0 auto;
-  padding: 20px;
-}
-
-.media-content {
-  margin-bottom: 40px;
-}
-
-.comments-section {
-  border-top: 1px solid #e5e7eb;
-  padding-top: 20px;
-}
-</style>
-```
-
-## Main App Setup
-
-```typescript
-// src/main.ts
-import { createApp } from 'vue'
-import { createPinia } from 'pinia'
-import { VueQueryPlugin } from '@tanstack/vue-query'
-import App from './App.vue'
-import './style.css'
-
-const app = createApp(App)
-const pinia = createPinia()
-
-app.use(pinia)
-app.use(VueQueryPlugin)
-
-app.mount('#app')
-```
+### 1. App Integration
 
 ```vue
 <!-- src/App.vue -->
 <template>
   <div id="app">
-    <header>
-      <nav>
-        <!-- Your navigation here -->
-      </nav>
-    </header>
+    <router-view />
+  </div>
+</template>
 
-    <main>
-      <RouterView />
-    </main>
+<script setup lang="ts">
+import { onMounted } from 'vue'
+import { useAuthStore } from '@/stores/authStore'
 
-    <!-- Toast notifications -->
-    <div class="toast-container">
-      <div
-        v-for="toast in toasts.toasts"
-        :key="toast.id"
-        :class="['toast', toast.type]"
-      >
-        {{ toast.message }}
-        <button @click="toasts.removeToast(toast.id)" class="toast-close">×</button>
-      </div>
+const authStore = useAuthStore()
+
+onMounted(() => {
+  authStore.initializeAuth()
+})
+</script>
+```
+
+### 2. Page Component with Comments
+
+```vue
+<!-- src/views/AnimeView.vue -->
+<template>
+  <div class="anime-page">
+    <!-- Your anime content -->
+    <div class="anime-info">
+      <h1>{{ anime.title }}</h1>
+      <p>{{ anime.description }}</p>
+    </div>
+
+    <!-- Comments section -->
+    <div class="comments-section">
+      <CommentSystem :media-id="anime.id" media-type="anime" />
     </div>
   </div>
 </template>
 
 <script setup lang="ts">
-import { useToast } from '@/composables/useToast'
+import { ref } from 'vue'
+import CommentSystem from '@/components/CommentSystem.vue'
 
-const toasts = useToast()
+interface Anime {
+  id: number
+  title: string
+  description: string
+}
+
+const anime = ref<Anime>({
+  id: 123,
+  title: 'Example Anime',
+  description: 'This is an example anime description.',
+})
 </script>
 
-<style>
-/* Global styles */
-.toast-container {
-  position: fixed;
-  top: 20px;
-  right: 20px;
-  z-index: 1000;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
+<style scoped>
+.anime-page {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 20px;
 }
 
-.toast {
-  padding: 12px 16px;
-  border-radius: 6px;
-  color: white;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  min-width: 250px;
-  box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+.anime-info {
+  margin-bottom: 40px;
 }
 
-.toast.success {
-  background: #10b981;
-}
-
-.toast.error {
-  background: #ef4444;
-}
-
-.toast.warning {
-  background: #f59e0b;
-}
-
-.toast.info {
-  background: #3b82f6;
-}
-
-.toast-close {
-  background: transparent;
-  border: none;
-  color: white;
-  font-size: 18px;
-  cursor: pointer;
-  margin-left: auto;
+.comments-section {
+  border-top: 1px solid #e2e8f0;
+  padding-top: 20px;
 }
 </style>
 ```
 
-This Vue.js integration provides a complete comment system using modern Vue 3 patterns, TypeScript, and Pinia for state management.
+### 3. With Auto Media Creation
+
+```vue
+<!-- src/components/MediaComments.vue -->
+<template>
+  <div class="media-comments">
+    <CommentSystem 
+      :media-id="undefined" 
+      :media-info="mediaInfo"
+      media-type="anime"
+    />
+  </div>
+</template>
+
+<script setup lang="ts">
+import { computed } from 'vue'
+import CommentSystem from '@/components/CommentSystem.vue'
+
+interface Props {
+  externalId: string
+  title: string
+  year?: number
+  posterUrl?: string
+}
+
+const props = defineProps<Props>()
+
+const mediaInfo = computed(() => ({
+  external_id: props.externalId,
+  media_type: 'anime' as const,
+  title: props.title,
+  year: props.year,
+  poster_url: props.posterUrl,
+}))
+</script>
+```
+
+## 🔒 Security Features
+
+### Session-Based Authentication
+- **No user_id parameters**: User identity is extracted from session tokens
+- **Automatic token management**: Tokens are stored and refreshed automatically
+- **Session validation**: All API calls validate the session token
+- **Automatic logout**: Sessions are cleared on expiration
+
+### Zero-Trust Architecture
+- **Server-side validation**: All user data is validated on the server
+- **No client trust**: No client-provided user data is trusted
+- **Real-time verification**: Provider tokens are verified with real APIs
+- **Audit logging**: All actions are logged for security
+
+### Error Handling
+- **Session expiration**: Automatic handling of expired sessions
+- **Network errors**: Graceful handling of connection issues
+- **Permission errors**: Clear error messages for permission issues
+
+## 🚨 Breaking Changes from Old Version
+
+### Before (Vulnerable)
+```typescript
+// ❌ OLD - Client could send any user_id
+await commentumAPI.request('/comments', {
+  method: 'POST',
+  body: JSON.stringify({
+    action: 'create',
+    user_id: 123,  // Could be faked!
+    media_id: 456,
+    content: 'Comment text'
+  })
+})
+```
+
+### After (Secure)
+```typescript
+// ✅ NEW - User ID extracted from session
+await commentumClient.createComment({
+  media_id: 456,
+  content: 'Comment text'  // No user_id needed!
+})
+```
+
+This secure Vue.js implementation ensures that comment operations can only be performed by authenticated users while preventing identity spoofing attacks.
