@@ -1,16 +1,12 @@
-# 🔒 Commentum Documentation - Secure Session-Based Authentication
+# Commentum Documentation
 
 A **comprehensive, enterprise-grade secure** comment system with advanced moderation, voting, and user management capabilities.
 
-## 🚨 **CRITICAL SECURITY UPDATE**
-
-**Previous versions had a critical identity spoofing vulnerability. This has been completely fixed with session-based authentication.**
-
-## 🚀 Overview
+## Overview
 
 Commentum is a **secure** comment system built on Supabase with TypeScript/Edge Functions. It provides a complete solution for adding comments to any media platform with **zero-trust security**:
 
-- **🔒 Session-Based Authentication**: Prevents identity spoofing attacks
+- **Session-Based Authentication**: Prevents identity spoofing attacks
 - **Nested Comments**: Support for threaded discussions with configurable nesting levels
 - **Voting System**: Upvote/downvote functionality with abuse detection
 - **Advanced Moderation**: Automated moderation, manual moderation, and escalation workflows
@@ -26,12 +22,12 @@ Commentum is a **secure** comment system built on Supabase with TypeScript/Edge 
 - [API Reference](#api-reference)
 - [Database Schema](#database-schema)
 - [Integration Guide](#integration-guide)
-- [🔒 Authentication](#-authentication)
-- [🛡️ Security](#️-security)
+- [Authentication](#-authentication)
+- [Security](#️-security)
 - [Examples](#examples)
 - [Troubleshooting](#troubleshooting)
 
-## 🚀 Quick Start (Secure)
+## Quick Start (Secure)
 
 ### Prerequisites
 
@@ -81,17 +77,17 @@ const comment = await commentResponse.json();
 
 ### Core Endpoints (All Session-Based)
 
-- **[🔒 Identity Resolution](./api/identity-resolve.md)** - Secure session creation and token verification
-- **[🔒 Comments](./api/comments.md)** - Session-based comment CRUD operations
-- **[🔒 Voting](./api/voting.md)** - Session-based upvote/downvote functionality
-- **[🔒 Reports](./api/reports.md)** - Session-based comment reporting and moderation
-- **[🔒 Moderation](./api/moderation.md)** - Session-based user moderation and admin actions
+- **[Identity Resolution](./api/identity-resolve.md)** - Secure session creation and token verification
+- **[Comments](./api/comments.md)** - Session-based comment CRUD operations
+- **[Voting](./api/voting.md)** - Session-based upvote/downvote functionality
+- **[Reports](./api/reports.md)** - Session-based comment reporting and moderation
+- **[Moderation](./api/moderation.md)** - Session-based user moderation and admin actions
 
 ## 🗄️ Database Schema
 
 The Commentum system uses a **secure** PostgreSQL schema with the following key components:
 
-- **[🔒 Users & Sessions](./database/users.md)** - User management and **secure session storage**
+- **[Users & Sessions](./database/users.md)** - User management and **secure session storage**
 - **[Comments System](./database/comments.md)** - Comments, threads, and content management
 - **[Moderation System](./database/moderation.md)** - Reports, warnings, and moderation actions
 - **[Voting System](./database/voting.md)** - Votes and abuse tracking
@@ -101,18 +97,14 @@ The Commentum system uses a **secure** PostgreSQL schema with the following key 
 
 For detailed **secure** integration instructions, see the [Integration Guide](./integration.md).
 
-## 🔒 Authentication
+## Authentication
 
-Commentum uses a **secure session-based authentication system** that prevents identity spoofing. See the [🔒 Authentication Guide](./authentication.md) for complete details.
+Commentum uses a **secure session-based authentication system** that prevents identity spoofing. See the [Authentication Guide](./authentication.md) for complete details.
 
-### 🚨 **Security Critical**
-- **❌ OLD**: Client could send any `user_id` (vulnerable to spoofing)
-- **✅ NEW**: Session tokens extracted from verified provider tokens only
-
-## 🛡️ Security
+## Security
 
 **Enterprise-grade security features**:
-- **🔒 Session-Based Authentication**: Cryptographically secure session tokens
+- **Session-Based Authentication**: Cryptographically secure session tokens
 - **Zero-Trust Architecture**: No client-provided user data trusted
 - **Real Token Verification**: All provider tokens verified with respective APIs
 - Row Level Security (RLS) on all tables
@@ -122,15 +114,15 @@ Commentum uses a **secure session-based authentication system** that prevents id
 - Input validation and sanitization
 - **Identity Spoofing Prevention**: Impossible to fake user identities
 
-See the [🛡️ Security Guide](./security.md) for comprehensive security documentation.
+See the [Security Guide](./security.md) for comprehensive security documentation.
 
 ## 💡 Examples
 
 Check out the [Examples](./examples/) directory for **secure** integration examples:
 
-- [🔒 React Integration](./examples/react.md) - Session-based authentication
-- [🔒 Vue.js Integration](./examples/vue.md) - Secure session management
-- [🔒 Vanilla JavaScript](./examples/vanilla.md) - Session-based API calls
+- [React Integration](./examples/react.md) - Session-based authentication
+- [Vue.js Integration](./examples/vue.md) - Secure session management
+- [Vanilla JavaScript](./examples/vanilla.md) - Session-based API calls
 
 ## ❓ Troubleshooting
 
@@ -146,4 +138,4 @@ For contributions to the documentation, please refer to the contributing guideli
 
 ---
 
-**🔒 Security Notice**: This system implements enterprise-grade session-based authentication that prevents identity spoofing attacks. All API calls require valid session tokens.
+**Security Notice**: This system implements enterprise-grade session-based authentication that prevents identity spoofing attacks. All API calls require valid session tokens.
