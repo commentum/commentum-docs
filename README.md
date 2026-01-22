@@ -27,7 +27,7 @@ Commentum is a **secure** comment system built on Supabase with TypeScript/Edge 
 - [Examples](#examples)
 - [Troubleshooting](#troubleshooting)
 
-## Quick Start (Secure)
+## Quick Start
 
 ### Prerequisites
 
@@ -73,7 +73,7 @@ const commentResponse = await fetch('/functions/v1/comments', {
 const comment = await commentResponse.json();
 ```
 
-## 📚 API Reference
+## API Reference
 
 ### Core Endpoints (All Session-Based)
 
@@ -83,7 +83,7 @@ const comment = await commentResponse.json();
 - **[Reports](./api/reports.md)** - Session-based comment reporting and moderation
 - **[Moderation](./api/moderation.md)** - Session-based user moderation and admin actions
 
-## 🗄️ Database Schema
+## Database Schema
 
 The Commentum system uses a **secure** PostgreSQL schema with the following key components:
 
@@ -93,7 +93,7 @@ The Commentum system uses a **secure** PostgreSQL schema with the following key 
 - **[Voting System](./database/voting.md)** - Votes and abuse tracking
 - **[System Configuration](./database/system.md)** - Settings and configuration
 
-## 🔧 Integration Guide
+## Integration Guide
 
 For detailed **secure** integration instructions, see the [Integration Guide](./integration.md).
 
@@ -116,7 +116,7 @@ Commentum uses a **secure session-based authentication system** that prevents id
 
 See the [Security Guide](./security.md) for comprehensive security documentation.
 
-## 💡 Examples
+## Examples
 
 Check out the [Examples](./examples/) directory for **secure** integration examples:
 
@@ -124,11 +124,11 @@ Check out the [Examples](./examples/) directory for **secure** integration examp
 - [Vue.js Integration](./examples/vue.md) - Secure session management
 - [Vanilla JavaScript](./examples/vanilla.md) - Session-based API calls
 
-## ❓ Troubleshooting
+## Troubleshooting
 
 Common issues and solutions can be found in the [Troubleshooting Guide](./troubleshooting.md).
 
-## 📝 License
+## License
 
 This documentation is part of the Commentum project. See the main repository [main repository](https://github.com/commentum/commentum) for license information.
 
