@@ -22,8 +22,8 @@ Commentum is a **secure** comment system built on Supabase with TypeScript/Edge 
 - [API Reference](#api-reference)
 - [Database Schema](#database-schema)
 - [Integration Guide](#integration-guide)
-- [Authentication](#-authentication)
-- [Security](#️-security)
+- [Authentication](#authentication)
+- [Security](#️security)
 - [Examples](#examples)
 - [Troubleshooting](#troubleshooting)
 
